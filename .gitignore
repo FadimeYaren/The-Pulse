@@ -1,0 +1,14 @@
+.venv/
+.flet/
+__pycache__/
+*.pyc
+
+# Kişisel Pulse verileri
+pulse.db
+
+# VS Code
+.vscode/
+
+# Sistem dosyaları
+.DS_Store
+Thumbs.db
