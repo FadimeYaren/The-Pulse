@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 
 # Kişisel Pulse verileri
-pulse.db
+*.db
 
 # VS Code
 .vscode/
