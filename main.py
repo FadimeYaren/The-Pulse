@@ -232,6 +232,33 @@ def calculate_stats(pulse_dates):
 
     return current_pulse, longest_pulse, total_pulse
 
+def get_pulse_status(pulse_dates):
+    if not pulse_dates:
+        return "NO PULSE", "This series has not received a pulse yet."
+
+    today = date.today()
+    last_pulse_date = pulse_dates[-1]
+
+    if last_pulse_date == today:
+        return "ALIVE", "Today's pulse is alive."
+
+    # Bugün henüz bitmediği için yalnızca tamamen kaçırılmış
+    # günleri sayıyoruz.
+    missed_days = max(
+        0,
+        (today - last_pulse_date).days - 1,
+    )
+
+    if missed_days == 0:
+        return "ALIVE", "Waiting for today's pulse."
+
+    if missed_days == 1:
+        return "REST", "One rest day. The pulse is still alive."
+
+    return (
+        "FLATLINE",
+        f"{missed_days} days without a pulse.",
+    )
 
 def main(page: ft.Page):
     initialize_database()
@@ -244,6 +271,15 @@ def main(page: ft.Page):
     longest_text = ft.Text(size=18)
     total_text = ft.Text(size=18)
     status_text = ft.Text("")
+
+    pulse_state_text = ft.Text(
+    size=18,
+    weight=ft.FontWeight.BOLD,
+)
+
+    pulse_state_detail = ft.Text(
+        size=14,
+    )
 
     series_title = ft.Text(
         size=22,
@@ -310,6 +346,13 @@ def main(page: ft.Page):
             calculate_stats(pulse_dates)
         )
 
+        pulse_state, pulse_state_message = (
+            get_pulse_status(pulse_dates)
+        )
+
+        pulse_state_text.value = pulse_state
+        pulse_state_detail.value = pulse_state_message
+
         current_text.value = (
             f"Current Pulse     {current_pulse}"
         )
@@ -322,17 +365,32 @@ def main(page: ft.Page):
 
         if pulse_exists_today(series_id):
             note_field.value = get_today_note(series_id)
+
             record_button.disabled = True
-            status_text.value = "♥ Today's pulse is alive."
+            record_button.content = "♥ PULSE RECORDED"
+
         else:
             note_field.value = ""
             record_button.disabled = False
-            status_text.value = ""
+
+            if pulse_state == "FLATLINE":
+                record_button.content = "♥ REVIVE"
+            else:
+                record_button.content = "♥ RECORD PULSE"
+
+        status_text.value = ""
 
     def record_pulse(e):
         series_id = selected_series_id()
         today = date.today().isoformat()
         note = note_field.value or ""
+
+        pulse_dates_before = get_pulse_dates(series_id)
+
+        was_flatline = (
+            get_pulse_status(pulse_dates_before)[0]
+            == "FLATLINE"
+        )
 
         try:
             with connect_database() as connection:
@@ -359,7 +417,11 @@ def main(page: ft.Page):
             return
 
         refresh_screen()
-        status_text.value = "♥ Pulse recorded."
+
+        if was_flatline:
+            status_text.value = "♥ Pulse revived."
+        else:
+            status_text.value = "♥ Pulse recorded."
 
     def change_series(e):
         refresh_screen()
@@ -455,6 +517,9 @@ def main(page: ft.Page):
                 ),
 
                 series_title,
+
+                pulse_state_text,
+                pulse_state_detail,
 
                 ft.Divider(),
 
