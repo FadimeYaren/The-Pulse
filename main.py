@@ -55,6 +55,26 @@ def initialize_database():
                     f"ALTER TABLE series ADD COLUMN {column_name} {definition}"
                 )
 
+        # Eski "haftada X kez" seçeneği hangi günün zorunlu olduğunu
+        # belirleyemediği için kaldırıldı. Daha önce bu modu kullanan serilerde
+        # işaretli günler korunarak açık gün planına dönüştürülür.
+        connection.execute(
+            """
+            UPDATE series
+            SET schedule_type = CASE
+                    WHEN TRIM(COALESCE(schedule_days, '')) <> ''
+                        THEN 'weekdays'
+                    ELSE 'daily'
+                END,
+                schedule_days = CASE
+                    WHEN TRIM(COALESCE(schedule_days, '')) <> ''
+                        THEN schedule_days
+                    ELSE '0,1,2,3,4,5,6'
+                END
+            WHERE schedule_type = 'weekly'
+            """
+        )
+
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS app_settings (
@@ -473,17 +493,6 @@ def open_exports_folder():
         return False
 
 
-def send_native_notification(title, message):
-    if sys.platform != "win32":
-        return False
-    try:
-        from winotify import Notification
-        Notification(app_id="The Pulse", title=title, msg=message).show()
-        return True
-    except (ImportError, OSError):
-        return False
-
-
 def create_series(name):
     if len(name) > SERIES_NAME_MAX_LENGTH:
         raise ValueError("Series name is too long.")
@@ -761,9 +770,6 @@ def get_pulse_status(pulse_dates, series_id=None):
     if last_pulse_date == today:
         return "ALIVE", "Today's pulse is alive."
 
-    if series_id is not None and not is_scheduled_day(series_id, today, pulse_dates):
-        return "ALIVE", "No pulse is scheduled today."
-
     # Bugün henüz bitmediği için yalnızca tamamen kaçırılmış
     # günleri sayıyoruz.
     missed_days = (
@@ -773,6 +779,16 @@ def get_pulse_status(pulse_dates, series_id=None):
         if series_id is not None
         else max(0, (today - last_pulse_date).days - 1)
     )
+
+    today_is_scheduled = (
+        series_id is None
+        or is_scheduled_day(series_id, today, pulse_dates)
+    )
+
+    # OFF DAY zinciri kendi başına değiştirmez. Ancak daha önce kaçırılmış
+    # planlı günler varsa mevcut REST / FLATLINE durumu korunur.
+    if missed_days == 0 and not today_is_scheduled:
+        return "ALIVE", "OFF DAY — your chain is safe today."
 
     if missed_days == 0:
         return "ALIVE", "Waiting for today's pulse."
@@ -1723,20 +1739,27 @@ def main(page: ft.Page):
             edit_note_button.visible = False
             save_note_button.visible = False
             undo_pulse_button.visible = False
-            record_button.disabled = False
+            scheduled_today = is_scheduled_day(
+                series_id, date.today(), pulse_dates
+            )
+            record_button.disabled = not scheduled_today
 
-            if pulse_state == "FLATLINE":
+            if not scheduled_today:
+                record_button.content = "OFF DAY — NO PULSE TODAY"
+            elif pulse_state == "FLATLINE":
                 record_button.content = "♥ REVIVE"
             else:
                 record_button.content = "♥ RECORD PULSE"
 
             record_button.style = ft.ButtonStyle(
                 bgcolor=(
-                    "#FF3158"
+                    "#303542"
+                    if not scheduled_today
+                    else "#FF3158"
                     if pulse_state == "NO PULSE"
                     else state_color
                 ),
-                color="#FFFFFF",
+                color="#8D95A5" if not scheduled_today else "#FFFFFF",
             )
 
         status_text.value = ""
@@ -1757,6 +1780,12 @@ def main(page: ft.Page):
         note = note_field.value or ""
 
         pulse_dates_before = get_pulse_dates(series_id)
+
+        if not is_scheduled_day(series_id, date.today(), pulse_dates_before):
+            status_text.value = "OFF DAY — no pulse is planned for today."
+            status_text.color = "#56C8FF"
+            page.update()
+            return
 
         was_flatline = (
             get_pulse_status(pulse_dates_before, series_id)[0]
@@ -2082,39 +2111,106 @@ def main(page: ft.Page):
         label="Description", multiline=True, min_lines=2, max_lines=4
     )
     profile_goal = ft.TextField(label="Goal", hint_text="Read at least 20 minutes")
-    profile_schedule = ft.Dropdown(
-        label="Schedule",
+    schedule_mode = ft.RadioGroup(
         value="daily",
-        options=[
-            ft.DropdownOption(key="daily", text="Every day"),
-            ft.DropdownOption(key="weekdays", text="Selected weekdays"),
-            ft.DropdownOption(key="weekly", text="Times per week"),
-        ],
+        content=ft.Column(
+            controls=[
+                ft.Radio(
+                    value="daily",
+                    label="Every day",
+                ),
+                ft.Text(
+                    "A pulse is expected seven days a week.",
+                    size=12,
+                    color="#8D95A5",
+                ),
+                ft.Radio(
+                    value="weekdays",
+                    label="Choose pulse days",
+                ),
+                ft.Text(
+                    "Only the days you select will count. Other days are OFF DAY.",
+                    size=12,
+                    color="#8D95A5",
+                ),
+            ],
+            spacing=3,
+        ),
     )
     weekday_checks = [
         ft.Checkbox(label=label, value=True)
-        for label in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for label in [
+            "Monday", "Tuesday", "Wednesday", "Thursday",
+            "Friday", "Saturday", "Sunday",
+        ]
     ]
-    weekly_target_field = ft.TextField(
-        label="Times per week", value="3", keyboard_type=ft.KeyboardType.NUMBER
+    weekday_section_title = ft.Text(
+        "Pulse days",
+        size=13,
+        weight=ft.FontWeight.BOLD,
+    )
+    weekday_section_help = ft.Text(
+        "Only these days require a pulse. All other days are OFF DAY and do not break your chain.",
+        size=12,
+        color="#8D95A5",
+    )
+    weekday_section = ft.Column(
+        controls=[
+            weekday_section_title,
+            weekday_section_help,
+            ft.Row(controls=weekday_checks, wrap=True),
+        ],
+        spacing=4,
+    )
+    schedule_summary = ft.Container(
+        bgcolor="#202633",
+        border=ft.Border.all(1, "#343A48"),
+        border_radius=8,
+        padding=12,
+        content=ft.Text(size=12, color="#D7DBE5"),
     )
     profile_message = ft.Text(size=12)
 
-    def save_series_profile(e):
-        try:
-            weekly_target = int(weekly_target_field.value or "0")
-        except ValueError:
-            weekly_target = 0
-        if profile_schedule.value == "weekly" and not 1 <= weekly_target <= 7:
-            profile_message.value = "Weekly target must be from 1 to 7."
-            profile_message.color = "#FF5D73"
+    def selected_weekday_names():
+        return [
+            checkbox.label
+            for checkbox in weekday_checks
+            if checkbox.value
+        ]
+
+    def refresh_schedule_editor(e=None):
+        schedule_type = schedule_mode.value or "daily"
+        weekday_section.visible = schedule_type == "weekdays"
+
+        if schedule_type == "daily":
+            summary = (
+                "PLAN: Every day requires a pulse."
+            )
+        else:
+            names = selected_weekday_names()
+            if names:
+                summary = (
+                    "PULSE DAYS: " + ", ".join(names) + ".\n"
+                    "All unselected days are OFF DAY. You cannot record a "
+                    "pulse on those days, and they never damage the chain."
+                )
+            else:
+                summary = "Select at least one day for this series."
+
+        schedule_summary.content.value = summary
+        if e is not None:
             page.update()
-            return
+
+    schedule_mode.on_change = refresh_schedule_editor
+    for checkbox in weekday_checks:
+        checkbox.on_change = refresh_schedule_editor
+
+    def save_series_profile(e):
         selected_days = [
             str(index) for index, checkbox in enumerate(weekday_checks)
             if checkbox.value
         ]
-        if profile_schedule.value == "weekdays" and not selected_days:
+        if schedule_mode.value == "weekdays" and not selected_days:
             profile_message.value = "Select at least one weekday."
             profile_message.color = "#FF5D73"
             page.update()
@@ -2123,9 +2219,13 @@ def main(page: ft.Page):
             selected_series_id(),
             profile_description.value or "",
             profile_goal.value or "",
-            profile_schedule.value,
-            ",".join(selected_days),
-            weekly_target if weekly_target else 7,
+            schedule_mode.value,
+            (
+                ",".join(selected_days)
+                if schedule_mode.value == "weekdays"
+                else "0,1,2,3,4,5,6"
+            ),
+            7,
         )
         page.pop_dialog()
         refresh_screen()
@@ -2140,9 +2240,14 @@ def main(page: ft.Page):
             controls=[
                 profile_description,
                 profile_goal,
-                profile_schedule,
-                ft.Row(controls=weekday_checks, wrap=True),
-                weekly_target_field,
+                ft.Text(
+                    "PULSE SCHEDULE",
+                    size=13,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                schedule_mode,
+                weekday_section,
+                schedule_summary,
                 profile_message,
             ],
             width=500,
@@ -2159,12 +2264,14 @@ def main(page: ft.Page):
         details = get_series_details(selected_series_id())
         profile_description.value = details[2]
         profile_goal.value = details[3]
-        profile_schedule.value = details[4]
+        schedule_mode.value = (
+            "weekdays" if details[4] == "weekdays" else "daily"
+        )
         selected_days = set((details[5] or "").split(","))
         for index, checkbox in enumerate(weekday_checks):
             checkbox.value = str(index) in selected_days
-        weekly_target_field.value = str(details[6])
         profile_message.value = ""
+        refresh_schedule_editor()
         page.show_dialog(series_profile_dialog)
 
     record_button.on_click = record_pulse
@@ -2792,6 +2899,13 @@ def main(page: ft.Page):
     def record_dashboard_pulse(series_id, note_control):
         if pulse_exists_today(series_id):
             return
+        if not is_scheduled_day(
+            series_id, date.today(), get_pulse_dates(series_id)
+        ):
+            status_text.value = "OFF DAY — no pulse is planned for today."
+            status_text.color = "#56C8FF"
+            page.update()
+            return
         note = note_control.value or ""
         with connect_database() as connection:
             connection.execute(
@@ -2844,6 +2958,9 @@ def main(page: ft.Page):
             series_id, pulse_dates
         )
         completed_today = pulse_exists_today(series_id)
+        scheduled_today = is_scheduled_day(
+            series_id, date.today(), pulse_dates
+        )
         note_control = ft.TextField(
             hint_text="What did you accomplish today?",
             value=get_today_note(series_id),
@@ -2862,17 +2979,19 @@ def main(page: ft.Page):
             content=(
                 "♥ PULSE RECORDED"
                 if completed_today
+                else "OFF DAY"
+                if not scheduled_today
                 else "♥ REVIVE"
                 if state_name == "FLATLINE"
                 else "♥ RECORD PULSE"
             ),
-            disabled=completed_today,
+            disabled=completed_today or not scheduled_today,
             on_click=(
                 lambda e, sid=series_id, field=note_control:
                 record_dashboard_pulse(sid, field)
             ),
         )
-        if not completed_today:
+        if not completed_today and scheduled_today:
             action_button.style = ft.ButtonStyle(
                 bgcolor="#FF3158" if state_name == "NO PULSE" else state_color,
                 color="#FFFFFF",
@@ -3191,22 +3310,6 @@ def main(page: ft.Page):
             ft.DropdownOption(key="sunday", text="Sunday"),
         ],
     )
-    reminder_time_setting = ft.TextField(
-        label="Daily reminder time",
-        hint_text="21:00",
-        value=get_setting("reminder_time") or "21:00",
-    )
-    reminders_enabled_setting = ft.Switch(
-        label="Daily reminders",
-        value=(get_setting("reminders_enabled") or "1") == "1",
-    )
-    reminder_time_setting.disabled = not reminders_enabled_setting.value
-
-    def toggle_reminders(e):
-        reminder_time_setting.disabled = not reminders_enabled_setting.value
-        page.update()
-
-    reminders_enabled_setting.on_change = toggle_reminders
     compact_dashboard_setting = ft.Switch(
         label="Compact Dashboard cards",
         value=(get_setting("compact_dashboard") or "1") == "1",
@@ -3308,21 +3411,8 @@ def main(page: ft.Page):
         page.update()
 
     def save_settings(e):
-        reminder_value = (reminder_time_setting.value or "").strip()
-        try:
-            hour_text, minute_text = reminder_value.split(":")
-            valid_time = 0 <= int(hour_text) <= 23 and 0 <= int(minute_text) <= 59
-        except (ValueError, AttributeError):
-            valid_time = False
-        if reminders_enabled_setting.value and not valid_time:
-            settings_message.value = "Use a valid 24-hour time such as 21:00."
-            settings_message.color = "#FF5D73"
-            page.update()
-            return
         save_setting("default_screen", default_screen_setting.value)
         save_setting("week_start", week_start_setting.value)
-        save_setting("reminder_time", reminder_value)
-        save_setting("reminders_enabled", int(reminders_enabled_setting.value))
         save_setting("compact_dashboard", int(compact_dashboard_setting.value))
         settings_message.value = "Settings saved."
         settings_message.color = "#35D07F"
@@ -3387,10 +3477,6 @@ def main(page: ft.Page):
             controls=[
                 default_screen_setting,
                 week_start_setting,
-                ft.Row(
-                    controls=[reminders_enabled_setting, reminder_time_setting],
-                    spacing=12,
-                ),
                 compact_dashboard_setting,
                 ft.Divider(),
                 ft.Text("EXPORT & IMPORT", weight=ft.FontWeight.BOLD),
@@ -3565,92 +3651,8 @@ def main(page: ft.Page):
     initial_screen = get_setting("default_screen") or "dashboard"
     show_section(initial_screen)
 
-    waiting_names = [
-        name
-        for series_id, name in get_series()
-        if (
-            is_scheduled_day(series_id, date.today(), get_pulse_dates(series_id))
-            and not pulse_exists_today(series_id)
-        )
-    ]
-    reminder_dialog = ft.AlertDialog(
-        modal=False,
-        title=ft.Text("Today's pulses are waiting"),
-        content=ft.Text(
-            "Still waiting: " + ", ".join(waiting_names)
-            if waiting_names
-            else "All scheduled pulses are complete."
-        ),
-        actions=[
-            ft.Button(content="Open Dashboard", on_click=lambda e: (
-                page.pop_dialog(), show_section("dashboard")
-            )),
-        ],
-    )
-
-    def reminder_is_due():
-        if (get_setting("reminders_enabled") or "1") != "1":
-            return False
-        reminder_text = get_setting("reminder_time") or "21:00"
-        try:
-            hour_value, minute_value = [int(value) for value in reminder_text.split(":")]
-        except ValueError:
-            return False
-        now = __import__("datetime").datetime.now()
-        return (
-            (now.hour, now.minute) >= (hour_value, minute_value)
-            and bool(waiting_names)
-            and get_setting("last_reminder_date") != date.today().isoformat()
-        )
-
-    async def reminder_monitor():
-        while True:
-            await asyncio.sleep(60)
-            if (get_setting("reminders_enabled") or "1") != "1":
-                continue
-            current_waiting = [
-                name
-                for series_id, name in get_series()
-                if (
-                    is_scheduled_day(
-                        series_id, date.today(), get_pulse_dates(series_id)
-                    )
-                    and not pulse_exists_today(series_id)
-                )
-            ]
-            if not current_waiting:
-                continue
-            reminder_text = get_setting("reminder_time") or "21:00"
-            now = __import__("datetime").datetime.now()
-            try:
-                hour_value, minute_value = [
-                    int(value) for value in reminder_text.split(":")
-                ]
-            except ValueError:
-                continue
-            if (
-                (now.hour, now.minute) >= (hour_value, minute_value)
-                and get_setting("last_reminder_date") != date.today().isoformat()
-            ):
-                save_setting("last_reminder_date", date.today().isoformat())
-                send_native_notification(
-                    "Today's pulses are waiting",
-                    f"{len(current_waiting)} series still waiting: "
-                    + ", ".join(current_waiting),
-                )
-
     if get_setting("onboarding_completed") != "1":
         page.show_dialog(onboarding_dialog)
-    elif reminder_is_due():
-        save_setting("last_reminder_date", date.today().isoformat())
-        notification_sent = send_native_notification(
-            "Today's pulses are waiting",
-            f"{len(waiting_names)} series still waiting: "
-            + ", ".join(waiting_names),
-        )
-        if not notification_sent:
-            page.show_dialog(reminder_dialog)
-    page.run_task(reminder_monitor)
 
 
 if __name__ == "__main__":
