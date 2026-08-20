@@ -5,16 +5,29 @@ import calendar
 import asyncio
 import csv
 import json
+import random
 import shutil
 import subprocess
 import sys
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
 DB_PATH = Path(__file__).with_name("pulse.db")
 SERIES_NAME_MAX_LENGTH = 50
+IMPORT_MAX_SERIES = 500
+IMPORT_MAX_ITEMS = 100000
+IMPORT_TEXT_MAX_LENGTH = 10000
+
+TROPHY_DEFINITIONS = {
+    "pulse_heart": ("Pulse Heart", "favorite", "#FF3158"),
+    "phoenix": ("Phoenix", "local_fire_department", "#FF7A45"),
+    "north_star": ("North Star", "star", "#FFC857"),
+    "guardian": ("Guardian Shield", "shield", "#56C8FF"),
+    "crystal": ("Signal Crystal", "auto_awesome", "#B58CFF"),
+    "classic": ("Classic Trophy", "emoji_events", "#F4F6FA"),
+}
 
 
 def connect_database():
@@ -84,6 +97,164 @@ def initialize_database():
             """
         )
 
+        # A schedule change must never reinterpret older pulse history. Each
+        # row describes the weekly plan starting on effective_from, until a
+        # newer row takes over.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_schedule_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id INTEGER NOT NULL,
+                effective_from TEXT NOT NULL,
+                schedule_type TEXT NOT NULL CHECK (
+                    schedule_type IN ('daily', 'weekdays')
+                ),
+                schedule_days TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+                UNIQUE (series_id, effective_from)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_schedule_versions_lookup
+            ON series_schedule_versions (series_id, effective_from DESC)
+            """
+        )
+
+        # A date override has priority over the weekly plan. It can turn one
+        # future date into either a required pulse day or an OFF DAY.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_date_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id INTEGER NOT NULL,
+                override_date TEXT NOT NULL,
+                is_scheduled INTEGER NOT NULL CHECK (is_scheduled IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+                UNIQUE (series_id, override_date)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trophy_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id INTEGER NOT NULL,
+                series_name_snapshot TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+                trophy_key TEXT NOT NULL,
+                random_choice INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (
+                    status IN ('active', 'earned', 'failed', 'cancelled')
+                ),
+                completed_at TEXT,
+                cancelled_at TEXT,
+                celebrated_at TEXT,
+                rest_count INTEGER,
+                pulse_count INTEGER,
+                planned_count INTEGER,
+                frame TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+            )
+            """
+        )
+        trophy_table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'trophy_targets'"
+        ).fetchone()[0]
+        if "cancelled" not in trophy_table_sql.lower():
+            connection.execute("DROP INDEX IF EXISTS idx_trophy_targets_series_status")
+            connection.execute("ALTER TABLE trophy_targets RENAME TO trophy_targets_legacy")
+            connection.execute(
+                """
+                CREATE TABLE trophy_targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    series_id INTEGER NOT NULL,
+                    series_name_snapshot TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    target_date TEXT NOT NULL,
+                    trophy_key TEXT NOT NULL,
+                    random_choice INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK (
+                        status IN ('active', 'earned', 'failed', 'cancelled')
+                    ),
+                    completed_at TEXT,
+                    cancelled_at TEXT,
+                    celebrated_at TEXT,
+                    rest_count INTEGER,
+                    pulse_count INTEGER,
+                    planned_count INTEGER,
+                    frame TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO trophy_targets (
+                    id, series_id, series_name_snapshot, start_date, target_date,
+                    trophy_key, random_choice, status, completed_at, cancelled_at,
+                    celebrated_at,
+                    rest_count, pulse_count, planned_count, frame, created_at
+                )
+                SELECT id, series_id, series_name_snapshot, start_date, target_date,
+                       trophy_key, random_choice, status, completed_at, NULL, NULL,
+                       rest_count, pulse_count, planned_count, frame, created_at
+                FROM trophy_targets_legacy
+                """
+            )
+            connection.execute("DROP TABLE trophy_targets_legacy")
+        trophy_columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(trophy_targets)"
+            ).fetchall()
+        }
+        if "celebrated_at" not in trophy_columns:
+            connection.execute(
+                "ALTER TABLE trophy_targets ADD COLUMN celebrated_at TEXT"
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trophy_targets_series_status
+            ON trophy_targets (series_id, status, target_date)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trophy_target_days (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_id INTEGER NOT NULL,
+                required_date TEXT NOT NULL,
+                FOREIGN KEY (target_id) REFERENCES trophy_targets(id) ON DELETE CASCADE,
+                UNIQUE (target_id, required_date)
+            )
+            """
+        )
+
+        # Existing installations receive one historical baseline. Subsequent
+        # changes are added as new versions instead of overwriting this row.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO series_schedule_versions (
+                series_id, effective_from, schedule_type, schedule_days
+            )
+            SELECT id,
+                   DATE(created_at),
+                   CASE WHEN schedule_type = 'weekdays' THEN 'weekdays' ELSE 'daily' END,
+                   CASE
+                       WHEN schedule_type = 'weekdays' THEN schedule_days
+                       ELSE '0,1,2,3,4,5,6'
+                   END
+            FROM series
+            """
+        )
+
         # Notlar pulse kaydından bağımsız tutulur. Böylece görev
         # yapılmayan REST / FLATLINE günlerine de not eklenebilir.
         connection.execute(
@@ -131,6 +302,16 @@ def initialize_database():
                 VALUES ('Daily Development')
                 """
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO series_schedule_versions (
+                    series_id, effective_from, schedule_type, schedule_days
+                )
+                SELECT id, ?, 'daily', '0,1,2,3,4,5,6'
+                FROM series WHERE name = 'Daily Development'
+                """,
+                (date.today().isoformat(),),
+            )
 
             return
 
@@ -143,6 +324,16 @@ def initialize_database():
                 INSERT OR IGNORE INTO series (name)
                 VALUES ('Daily Development')
                 """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO series_schedule_versions (
+                    series_id, effective_from, schedule_type, schedule_days
+                )
+                SELECT id, ?, 'daily', '0,1,2,3,4,5,6'
+                FROM series WHERE name = 'Daily Development'
+                """,
+                (date.today().isoformat(),),
             )
 
             default_series_id = connection.execute(
@@ -250,6 +441,561 @@ def update_series_profile(
         )
 
 
+def get_schedule_for_day(series_id, day_value):
+    """Return the schedule version that was active on a particular date."""
+    with connect_database() as connection:
+        row = connection.execute(
+            """
+            SELECT schedule_type, schedule_days, effective_from
+            FROM series_schedule_versions
+            WHERE series_id = ? AND effective_from <= ?
+            ORDER BY effective_from DESC
+            LIMIT 1
+            """,
+            (series_id, day_value.isoformat()),
+        ).fetchone()
+    if row:
+        return row
+
+    details = get_series_details(series_id)
+    if not details:
+        return "daily", "0,1,2,3,4,5,6", day_value.isoformat()
+    schedule_type = "weekdays" if details[4] == "weekdays" else "daily"
+    schedule_days = details[5] if schedule_type == "weekdays" else "0,1,2,3,4,5,6"
+    return schedule_type, schedule_days, day_value.isoformat()
+
+
+def save_series_schedule(series_id, effective_from, schedule_type, schedule_days):
+    if schedule_type not in {"daily", "weekdays"}:
+        raise ValueError("Choose a valid schedule type.")
+    parsed_date = date.fromisoformat(str(effective_from))
+    if parsed_date < date.today():
+        raise ValueError("A new schedule cannot start in the past.")
+    normalized_days = "0,1,2,3,4,5,6" if schedule_type == "daily" else schedule_days
+    if schedule_type == "weekdays" and not normalized_days:
+        raise ValueError("Select at least one weekday.")
+
+    with connect_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO series_schedule_versions (
+                series_id, effective_from, schedule_type, schedule_days
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(series_id, effective_from) DO UPDATE SET
+                schedule_type = excluded.schedule_type,
+                schedule_days = excluded.schedule_days,
+                created_at = CURRENT_TIMESTAMP
+            """,
+            (series_id, parsed_date.isoformat(), schedule_type, normalized_days),
+        )
+        # Keep legacy columns populated for backward-compatible exports and
+        # older app versions. Date-aware calculations use the version table.
+        connection.execute(
+            """
+            UPDATE series
+            SET schedule_type = ?, schedule_days = ?, weekly_target = 7
+            WHERE id = ?
+            """,
+            (schedule_type, normalized_days, series_id),
+        )
+
+
+def get_schedule_versions(series_id):
+    with connect_database() as connection:
+        return connection.execute(
+            """
+            SELECT effective_from, schedule_type, schedule_days
+            FROM series_schedule_versions
+            WHERE series_id = ?
+            ORDER BY effective_from DESC
+            """,
+            (series_id,),
+        ).fetchall()
+
+
+def set_date_override(series_id, override_date, is_scheduled):
+    parsed_date = date.fromisoformat(str(override_date))
+    if parsed_date < date.today():
+        raise ValueError("Past days cannot be changed.")
+    with connect_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO series_date_overrides (
+                series_id, override_date, is_scheduled
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(series_id, override_date) DO UPDATE SET
+                is_scheduled = excluded.is_scheduled,
+                created_at = CURRENT_TIMESTAMP
+            """,
+            (series_id, parsed_date.isoformat(), int(bool(is_scheduled))),
+        )
+
+
+def set_date_overrides(series_id, override_dates, is_scheduled):
+    parsed_dates = sorted({
+        date.fromisoformat(str(override_date))
+        for override_date in override_dates
+    })
+    if not parsed_dates:
+        raise ValueError("Select at least one exception date.")
+    if parsed_dates[0] < date.today():
+        raise ValueError("Past days cannot be changed.")
+    with connect_database() as connection:
+        connection.executemany(
+            """
+            INSERT INTO series_date_overrides (
+                series_id, override_date, is_scheduled
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(series_id, override_date) DO UPDATE SET
+                is_scheduled = excluded.is_scheduled,
+                created_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (series_id, picked_date.isoformat(), int(bool(is_scheduled)))
+                for picked_date in parsed_dates
+            ],
+        )
+
+
+def create_trophy_target(series_id, target_date, trophy_key):
+    parsed_target = date.fromisoformat(str(target_date))
+    if parsed_target <= date.today():
+        raise ValueError("Choose a trophy target after today.")
+    random_choice = trophy_key == "random"
+    if random_choice:
+        trophy_key = random.choice(list(TROPHY_DEFINITIONS))
+    if trophy_key not in TROPHY_DEFINITIONS:
+        raise ValueError("Choose a valid trophy.")
+
+    start_day = date.today()
+    required_dates = []
+    current_day = start_day
+    while current_day <= parsed_target:
+        if is_scheduled_day(series_id, current_day):
+            required_dates.append(current_day.isoformat())
+        current_day += timedelta(days=1)
+    if not required_dates:
+        raise ValueError("This target has no planned Pulse days.")
+
+    with connect_database() as connection:
+        active = connection.execute(
+            "SELECT 1 FROM trophy_targets WHERE series_id = ? AND status = 'active'",
+            (series_id,),
+        ).fetchone()
+        if active:
+            raise ValueError("This series already has an active trophy target.")
+        series_row = connection.execute(
+            "SELECT name FROM series WHERE id = ?",
+            (series_id,),
+        ).fetchone()
+        if series_row is None:
+            raise ValueError("Series not found.")
+        cursor = connection.execute(
+            """
+            INSERT INTO trophy_targets (
+                series_id, series_name_snapshot, start_date, target_date,
+                trophy_key, random_choice
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                series_id,
+                series_row[0],
+                start_day.isoformat(),
+                parsed_target.isoformat(),
+                trophy_key,
+                int(random_choice),
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO trophy_target_days (target_id, required_date)
+            VALUES (?, ?)
+            """,
+            [(cursor.lastrowid, required_date) for required_date in required_dates],
+        )
+
+
+def cancel_active_trophy_target(target_id, series_id):
+    with connect_database() as connection:
+        connection.execute(
+            """
+            UPDATE trophy_targets
+            SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP,
+                completed_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND series_id = ? AND status = 'active'
+            """,
+            (target_id, series_id),
+        )
+
+
+def get_target_required_dates(target_id, series_id, start_date, target_date):
+    with connect_database() as connection:
+        rows = connection.execute(
+            """
+            SELECT required_date FROM trophy_target_days
+            WHERE target_id = ? ORDER BY required_date
+            """,
+            (target_id,),
+        ).fetchall()
+    if rows:
+        return [date.fromisoformat(row[0]) for row in rows]
+
+    # Existing targets created before schema v3 receive a one-time snapshot.
+    required_dates = []
+    current_day = start_date
+    while current_day <= target_date:
+        if is_scheduled_day(series_id, current_day):
+            required_dates.append(current_day)
+        current_day += timedelta(days=1)
+    with connect_database() as connection:
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO trophy_target_days (target_id, required_date)
+            VALUES (?, ?)
+            """,
+            [(target_id, day_value.isoformat()) for day_value in required_dates],
+        )
+    return required_dates
+
+
+def _trophy_target_metrics(series_id, start_date, end_date, target_id=None):
+    pulses = set(get_pulse_dates(series_id, include_inactive=True))
+    frozen_required_dates = (
+        set(get_target_required_dates(target_id, series_id, start_date, end_date))
+        if target_id is not None else None
+    )
+    planned_count = 0
+    pulse_count = 0
+    rest_count = 0
+    consecutive_rests = 0
+    flatlined = False
+    current_day = start_date
+    while current_day <= end_date:
+        is_required = (
+            current_day in frozen_required_dates
+            if frozen_required_dates is not None
+            else is_scheduled_day(series_id, current_day, pulses)
+        )
+        if is_required:
+            planned_count += 1
+            if current_day in pulses:
+                pulse_count += 1
+                consecutive_rests = 0
+            else:
+                rest_count += 1
+                consecutive_rests += 1
+                if consecutive_rests >= 2:
+                    flatlined = True
+        current_day += timedelta(days=1)
+    return planned_count, pulse_count, rest_count, flatlined
+
+
+def refresh_trophy_target_states(series_id=None):
+    with connect_database() as connection:
+        if series_id is None:
+            rows = connection.execute(
+                """
+                SELECT id, series_id, start_date, target_date
+                FROM trophy_targets WHERE status = 'active'
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT id, series_id, start_date, target_date
+                FROM trophy_targets
+                WHERE status = 'active' AND series_id = ?
+                """,
+                (series_id,),
+            ).fetchall()
+
+    today = date.today()
+    for target_id, target_series_id, start_text, target_text in rows:
+        start_day = date.fromisoformat(start_text)
+        target_day = date.fromisoformat(target_text)
+        frozen_required_dates = set(
+            get_target_required_dates(
+                target_id, target_series_id, start_day, target_day
+            )
+        )
+        raw_pulses = set(
+            get_pulse_dates(target_series_id, include_inactive=True)
+        )
+        last_finished_day = min(target_day, today - timedelta(days=1))
+        target_complete_today = (
+            target_day == today
+            and (
+                target_day not in frozen_required_dates
+                or today in raw_pulses
+            )
+        )
+        evaluation_end = target_day if target_complete_today else last_finished_day
+        if evaluation_end < start_day:
+            continue
+
+        planned, pulses, rests, flatlined = _trophy_target_metrics(
+            target_series_id, start_day, evaluation_end, target_id
+        )
+        if flatlined:
+            status = "failed"
+            frame = None
+        elif target_day < today or target_complete_today:
+            status = "earned"
+            frame = (
+                "gold" if rests == 0
+                else "silver" if rests == 1
+                else "bronze" if rests == 2
+                else "none"
+            )
+        else:
+            continue
+
+        with connect_database() as connection:
+            connection.execute(
+                """
+                UPDATE trophy_targets
+                SET status = ?, completed_at = CURRENT_TIMESTAMP,
+                    rest_count = ?, pulse_count = ?, planned_count = ?, frame = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (status, rests, pulses, planned, frame, target_id),
+            )
+
+
+def get_trophy_targets(series_id):
+    refresh_trophy_target_states(series_id)
+    with connect_database() as connection:
+        return connection.execute(
+            """
+            SELECT id, series_name_snapshot, start_date, target_date,
+                   trophy_key, random_choice, status, completed_at,
+                   rest_count, pulse_count, planned_count, frame
+            FROM trophy_targets
+            WHERE series_id = ?
+            ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                     target_date DESC, id DESC
+            """,
+            (series_id,),
+        ).fetchall()
+
+
+def get_earned_trophies(series_id=None):
+    query = """
+        SELECT id, series_id, series_name_snapshot, start_date, target_date,
+               trophy_key, completed_at, rest_count, pulse_count,
+               planned_count, frame
+        FROM trophy_targets
+        WHERE status = 'earned'
+    """
+    parameters = []
+    if series_id is not None:
+        query += " AND series_id = ?"
+        parameters.append(series_id)
+    query += " ORDER BY COALESCE(completed_at, target_date) DESC, id DESC"
+    with connect_database() as connection:
+        return connection.execute(query, parameters).fetchall()
+
+
+def get_uncelebrated_earned_trophy():
+    with connect_database() as connection:
+        return connection.execute(
+            """
+            SELECT id, series_id, series_name_snapshot, start_date, target_date,
+                   trophy_key, completed_at, rest_count, pulse_count,
+                   planned_count, frame
+            FROM trophy_targets
+            WHERE status = 'earned' AND celebrated_at IS NULL
+            ORDER BY COALESCE(completed_at, target_date), id
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+def mark_trophy_celebrated(target_id):
+    with connect_database() as connection:
+        connection.execute(
+            """
+            UPDATE trophy_targets
+            SET celebrated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'earned'
+            """,
+            (target_id,),
+        )
+
+
+def create_trophy_share_card(target_id):
+    """Render an earned trophy as a social-media friendly PNG card."""
+    with connect_database() as connection:
+        row = connection.execute(
+            """
+            SELECT series_name_snapshot, start_date, target_date, trophy_key,
+                   rest_count, pulse_count, planned_count, frame
+            FROM trophy_targets
+            WHERE id = ? AND status = 'earned'
+            """,
+            (target_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError("Only earned trophies can be shared.")
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as error:
+        raise ValueError(
+            "PNG share cards require Pillow. Install it with: pip install pillow"
+        ) from error
+
+    series_name, start_text, target_text, trophy_key, rests, pulses, planned, frame = row
+    trophy_name, _, trophy_color = TROPHY_DEFINITIONS.get(
+        trophy_key, TROPHY_DEFINITIONS["classic"]
+    )
+    frame_colors = {
+        "gold": "#FFD45C", "silver": "#C9D0DA",
+        "bronze": "#C88752", "none": "#343A48", None: "#343A48",
+    }
+    image = Image.new("RGB", (1200, 630), "#090B10")
+    draw = ImageDraw.Draw(image)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    title_font = ImageFont.truetype(bold_path, 54)
+    trophy_font = ImageFont.truetype(bold_path, 44)
+    body_font = ImageFont.truetype(font_path, 28)
+    small_font = ImageFont.truetype(bold_path, 22)
+
+    draw.rounded_rectangle((35, 35, 1165, 595), radius=38, fill="#11151F",
+                           outline=frame_colors.get(frame, "#343A48"), width=8)
+    draw.text((75, 70), "THE PULSE", font=title_font, fill="#F4F6FA")
+    draw.text((78, 139), "TROPHY EARNED", font=small_font, fill="#56C8FF")
+
+    color = trophy_color
+    draw.ellipse((105, 225, 325, 445), fill="#151923", outline=color, width=6)
+    draw.rounded_rectangle((165, 260, 265, 355), radius=15, fill=color)
+    draw.polygon([(165, 280), (125, 265), (135, 335), (180, 355)], fill=color)
+    draw.polygon([(265, 280), (305, 265), (295, 335), (250, 355)], fill=color)
+    draw.rectangle((202, 350, 228, 395), fill=color)
+    draw.rounded_rectangle((165, 392, 265, 418), radius=10, fill=color)
+
+    draw.text((375, 225), trophy_name, font=trophy_font, fill="#F4F6FA")
+    draw.text((378, 292), series_name, font=body_font, fill="#A9B0BF")
+    frame_label = "FRAMELESS" if frame in {None, "none"} else f"{frame.upper()} FRAME"
+    draw.text((378, 348), frame_label, font=small_font,
+              fill=frame_colors.get(frame, "#A9B0BF"))
+    draw.text((378, 397), f"{pulses or 0}/{planned or 0} PULSES  •  {rests or 0} REST",
+              font=body_font, fill="#F4F6FA")
+    draw.text((378, 452), f"{start_text}  →  {target_text}", font=body_font,
+              fill="#8D95A5")
+    draw.text((78, 540), "Keep it alive.", font=body_font, fill="#FF3158")
+
+    export_dir = DB_PATH.with_name("exports")
+    export_dir.mkdir(exist_ok=True)
+    path = export_dir / f"trophy-{target_id}-{_safe_export_name(trophy_name)}.png"
+    image.save(path, "PNG")
+    return path
+
+
+def get_active_trophy_target(series_id):
+    rows = get_trophy_targets(series_id)
+    return next((row for row in rows if row[6] == "active"), None)
+
+
+def get_active_trophy_progress(series_id):
+    target = get_active_trophy_target(series_id)
+    if target is None:
+        return None
+
+    (
+        target_id, series_snapshot, start_text, target_text,
+        trophy_key, random_choice, status, completed_at,
+        stored_rests, stored_pulses, stored_planned, stored_frame,
+    ) = target
+    start_day = date.fromisoformat(start_text)
+    target_day = date.fromisoformat(target_text)
+    pulse_set = set(get_pulse_dates(series_id, include_inactive=True))
+    required_date_set = set(
+        get_target_required_dates(target_id, series_id, start_day, target_day)
+    )
+    today = date.today()
+
+    planned_total = 0
+    pulse_count = 0
+    rest_count = 0
+    current_day = start_day
+    while current_day <= target_day:
+        if current_day in required_date_set:
+            planned_total += 1
+            if current_day <= today and current_day in pulse_set:
+                pulse_count += 1
+            elif current_day < today:
+                rest_count += 1
+        current_day += timedelta(days=1)
+
+    required_pulses = max(pulse_count, planned_total - rest_count)
+    remaining_pulses = max(0, required_pulses - pulse_count)
+    progress = (
+        min(1.0, pulse_count / required_pulses)
+        if required_pulses > 0 else 0.0
+    )
+    frame = (
+        "gold" if rest_count == 0
+        else "silver" if rest_count == 1
+        else "bronze" if rest_count == 2
+        else "none"
+    )
+    return {
+        "id": target_id,
+        "series_name": series_snapshot,
+        "start_date": start_day,
+        "target_date": target_day,
+        "trophy_key": trophy_key,
+        "random_choice": bool(random_choice),
+        "planned_total": planned_total,
+        "pulse_count": pulse_count,
+        "rest_count": rest_count,
+        "required_pulses": required_pulses,
+        "remaining_pulses": remaining_pulses,
+        "calendar_days_left": max(0, (target_day - today).days),
+        "progress": progress,
+        "frame": frame,
+    }
+
+
+def delete_date_override(series_id, override_date):
+    parsed_date = date.fromisoformat(str(override_date))
+    if parsed_date < date.today():
+        raise ValueError("Past date exceptions are locked and cannot be removed.")
+    with connect_database() as connection:
+        connection.execute(
+            """
+            DELETE FROM series_date_overrides
+            WHERE series_id = ? AND override_date = ?
+            """,
+            (series_id, parsed_date.isoformat()),
+        )
+
+
+def get_date_overrides(series_id, from_date=None):
+    with connect_database() as connection:
+        if from_date is None:
+            return connection.execute(
+                """
+                SELECT override_date, is_scheduled
+                FROM series_date_overrides
+                WHERE series_id = ?
+                ORDER BY override_date
+                """,
+                (series_id,),
+            ).fetchall()
+        return connection.execute(
+            """
+            SELECT override_date, is_scheduled
+            FROM series_date_overrides
+            WHERE series_id = ? AND override_date >= ?
+            ORDER BY override_date
+            """,
+            (series_id, from_date.isoformat()),
+        ).fetchall()
+
+
 def set_series_archived(series_id, archived):
     with connect_database() as connection:
         connection.execute(
@@ -316,7 +1062,7 @@ def export_series_data(series_id):
         for day_text, has_pulse, note in reversed(rows):
             if note or has_pulse:
                 stream.write(
-                    f"## {day_text} — {'PULSE' if has_pulse else 'NO PULSE'}\n\n"
+                    f"## {day_text} - {'PULSE' if has_pulse else 'NO PULSE'}\n\n"
                     f"{note or 'No note recorded.'}\n\n"
                 )
     return csv_path, md_path
@@ -370,6 +1116,78 @@ def create_portable_export(series_id=None):
                     (row[0],),
                 ).fetchall()
             ]
+            schedule_history = [
+                {
+                    "effective_from": effective_from,
+                    "type": schedule_type,
+                    "days": schedule_days,
+                }
+                for effective_from, schedule_type, schedule_days
+                in connection.execute(
+                    """
+                    SELECT effective_from, schedule_type, schedule_days
+                    FROM series_schedule_versions
+                    WHERE series_id = ?
+                    ORDER BY effective_from
+                    """,
+                    (row[0],),
+                ).fetchall()
+            ]
+            date_overrides = [
+                {
+                    "date": override_date,
+                    "is_scheduled": bool(is_scheduled),
+                }
+                for override_date, is_scheduled in connection.execute(
+                    """
+                    SELECT override_date, is_scheduled
+                    FROM series_date_overrides
+                    WHERE series_id = ?
+                    ORDER BY override_date
+                    """,
+                    (row[0],),
+                ).fetchall()
+            ]
+            trophy_targets = []
+            for target in connection.execute(
+                """
+                SELECT id, series_name_snapshot, start_date, target_date,
+                       trophy_key, random_choice, status, completed_at,
+                       cancelled_at, rest_count, pulse_count, planned_count,
+                       frame, created_at
+                FROM trophy_targets
+                WHERE series_id = ? ORDER BY id
+                """,
+                (row[0],),
+            ).fetchall():
+                required_dates = [
+                    required_date
+                    for (required_date,) in connection.execute(
+                        """
+                        SELECT required_date FROM trophy_target_days
+                        WHERE target_id = ? ORDER BY required_date
+                        """,
+                        (target[0],),
+                    ).fetchall()
+                ]
+                trophy_targets.append(
+                    {
+                        "series_name_snapshot": target[1],
+                        "start_date": target[2],
+                        "target_date": target[3],
+                        "trophy_key": target[4],
+                        "random_choice": bool(target[5]),
+                        "status": target[6],
+                        "completed_at": target[7],
+                        "cancelled_at": target[8],
+                        "rest_count": target[9],
+                        "pulse_count": target[10],
+                        "planned_count": target[11],
+                        "frame": target[12],
+                        "created_at": target[13],
+                        "required_dates": required_dates,
+                    }
+                )
             series_rows.append(
                 {
                     "name": row[1],
@@ -380,6 +1198,9 @@ def create_portable_export(series_id=None):
                         "days": row[5],
                         "weekly_target": row[6],
                     },
+                    "schedule_history": schedule_history,
+                    "date_overrides": date_overrides,
+                    "trophy_targets": trophy_targets,
                     "archived": bool(row[7]),
                     "created_at": row[8],
                     "pulses": pulses,
@@ -392,7 +1213,7 @@ def create_portable_export(series_id=None):
     export_path = export_dir / f"{_safe_export_name(label)}-{stamp}.pulse.json"
     payload = {
         "format": "the-pulse-portable-data",
-        "schema_version": 1,
+        "schema_version": 3,
         "exported_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
         "series": series_rows,
     }
@@ -416,6 +1237,47 @@ def _unique_series_name(connection, requested_name):
     return candidate
 
 
+def _validated_import_date(value, label, allow_future=True):
+    try:
+        parsed = date.fromisoformat(str(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"The export contains an invalid {label}.") from error
+    if not allow_future and parsed > date.today():
+        raise ValueError("The export contains a pulse dated in the future.")
+    return parsed
+
+
+def _validated_schedule(schedule_type, schedule_days):
+    if schedule_type not in {"daily", "weekdays"}:
+        raise ValueError("The export contains an invalid schedule type.")
+    raw_days = str(schedule_days or "0,1,2,3,4,5,6").split(",")
+    try:
+        days = [int(value.strip()) for value in raw_days]
+    except ValueError as error:
+        raise ValueError("The export contains invalid pulse days.") from error
+    if not days or len(days) != len(set(days)) or any(day not in range(7) for day in days):
+        raise ValueError("The export contains invalid pulse days.")
+    return ",".join(str(day) for day in sorted(days))
+
+
+def _bounded_import_text(value, label, maximum=IMPORT_TEXT_MAX_LENGTH):
+    text = str(value or "")
+    if len(text) > maximum:
+        raise ValueError(f"The export contains a {label} that is too long.")
+    return text
+
+
+def _validated_import_timestamp(value, label):
+    if not value:
+        return None
+    text = str(value)
+    try:
+        datetime.fromisoformat(text)
+    except ValueError as error:
+        raise ValueError(f"The export contains an invalid {label}.") from error
+    return text
+
+
 def import_portable_export(file_path):
     source_path = Path(file_path).expanduser()
     if not source_path.is_file():
@@ -426,10 +1288,24 @@ def import_portable_export(file_path):
         raise ValueError("This is not a readable The Pulse export file.") from error
     if (
         payload.get("format") != "the-pulse-portable-data"
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") not in {1, 2, 3}
         or not isinstance(payload.get("series"), list)
     ):
         raise ValueError("This file is not a supported The Pulse export.")
+    if not payload["series"] or len(payload["series"]) > IMPORT_MAX_SERIES:
+        raise ValueError("The export contains an invalid number of series.")
+
+    item_count = 0
+    for item in payload["series"]:
+        if not isinstance(item, dict):
+            raise ValueError("The export contains invalid series data.")
+        for key in ("schedule_history", "date_overrides", "pulses", "notes", "trophy_targets"):
+            values = item.get(key) or []
+            if not isinstance(values, list):
+                raise ValueError(f"The export contains invalid {key} data.")
+            item_count += len(values)
+    if item_count > IMPORT_MAX_ITEMS:
+        raise ValueError("The export is too large to import safely.")
 
     imported_names = []
     with connect_database() as connection:
@@ -437,6 +1313,18 @@ def import_portable_export(file_path):
             if not isinstance(item, dict):
                 raise ValueError("The export contains invalid series data.")
             schedule = item.get("schedule") or {}
+            if not isinstance(schedule, dict):
+                raise ValueError("The export contains invalid schedule data.")
+            schedule_type = schedule.get("type") or "daily"
+            schedule_days = _validated_schedule(
+                schedule_type, schedule.get("days") or "0,1,2,3,4,5,6"
+            )
+            try:
+                weekly_target = int(schedule.get("weekly_target") or len(schedule_days.split(",")))
+            except (TypeError, ValueError) as error:
+                raise ValueError("The export contains an invalid weekly target.") from error
+            if weekly_target not in range(1, 8):
+                raise ValueError("The export contains an invalid weekly target.")
             imported_name = _unique_series_name(connection, item.get("name"))
             cursor = connection.execute(
                 """
@@ -447,24 +1335,80 @@ def import_portable_export(file_path):
                 """,
                 (
                     imported_name,
-                    str(item.get("description") or ""),
-                    str(item.get("goal") or ""),
-                    schedule.get("type") or "daily",
-                    schedule.get("days") or "0,1,2,3,4,5,6",
-                    int(schedule.get("weekly_target") or 7),
+                    _bounded_import_text(item.get("description"), "description"),
+                    _bounded_import_text(item.get("goal"), "goal"),
+                    schedule_type,
+                    schedule_days,
+                    weekly_target,
                 ),
             )
             new_series_id = cursor.lastrowid
+            schedule_history = item.get("schedule_history") or []
+            if not schedule_history:
+                pulse_values = item.get("pulses") or []
+                fallback_start = (
+                    min(str(value) for value in pulse_values)
+                    if pulse_values
+                    else date.today().isoformat()
+                )
+                schedule_history = [
+                    {
+                        "effective_from": fallback_start,
+                        "type": schedule.get("type") or "daily",
+                        "days": schedule.get("days") or "0,1,2,3,4,5,6",
+                    }
+                ]
+            for version in schedule_history:
+                if not isinstance(version, dict):
+                    raise ValueError("The export contains invalid schedule history.")
+                effective_from = _validated_import_date(
+                    version.get("effective_from"), "schedule date"
+                ).isoformat()
+                version_type = version.get("type") or "daily"
+                version_days = _validated_schedule(
+                    version_type, version.get("days") or "0,1,2,3,4,5,6"
+                )
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO series_schedule_versions (
+                        series_id, effective_from, schedule_type, schedule_days
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (new_series_id, effective_from, version_type, version_days),
+                )
+            for override in item.get("date_overrides") or []:
+                if not isinstance(override, dict):
+                    raise ValueError("The export contains invalid date exceptions.")
+                override_date = _validated_import_date(
+                    override.get("date"), "exception date"
+                ).isoformat()
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO series_date_overrides (
+                        series_id, override_date, is_scheduled
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        new_series_id,
+                        override_date,
+                        int(bool(override.get("is_scheduled"))),
+                    ),
+                )
             for pulse_date in item.get("pulses") or []:
-                date.fromisoformat(str(pulse_date))
+                pulse_date = _validated_import_date(
+                    pulse_date, "pulse date", allow_future=False
+                ).isoformat()
                 connection.execute(
                     "INSERT OR IGNORE INTO pulse_entries "
                     "(series_id, pulse_date, note) VALUES (?, ?, '')",
-                    (new_series_id, str(pulse_date)),
+                    (new_series_id, pulse_date),
                 )
             for note_item in item.get("notes") or []:
-                note_date = str(note_item.get("date"))
-                date.fromisoformat(note_date)
+                if not isinstance(note_item, dict):
+                    raise ValueError("The export contains invalid notes.")
+                note_date = _validated_import_date(
+                    note_item.get("date"), "note date"
+                ).isoformat()
                 connection.execute(
                     """
                     INSERT INTO daily_notes (series_id, note_date, note)
@@ -472,7 +1416,90 @@ def import_portable_export(file_path):
                     ON CONFLICT(series_id, note_date) DO UPDATE SET
                         note = excluded.note
                     """,
-                    (new_series_id, note_date, str(note_item.get("note") or "")),
+                    (
+                        new_series_id,
+                        note_date,
+                        _bounded_import_text(note_item.get("note"), "note"),
+                    ),
+                )
+            active_target_seen = False
+            for target in item.get("trophy_targets") or []:
+                if not isinstance(target, dict):
+                    raise ValueError("The export contains invalid trophy target data.")
+                start_date = _validated_import_date(
+                    target.get("start_date"), "trophy start date"
+                )
+                target_date = _validated_import_date(
+                    target.get("target_date"), "trophy target date"
+                )
+                if target_date < start_date:
+                    raise ValueError("A trophy target ends before it starts.")
+                trophy_key = target.get("trophy_key")
+                if trophy_key not in TROPHY_DEFINITIONS:
+                    raise ValueError("The export contains an unknown trophy.")
+                status = target.get("status") or "failed"
+                if status not in {"active", "earned", "failed", "cancelled"}:
+                    raise ValueError("The export contains an invalid trophy status.")
+                if status == "active" and active_target_seen:
+                    raise ValueError("A series cannot contain two active trophy targets.")
+                active_target_seen = active_target_seen or status == "active"
+                frame = target.get("frame")
+                if frame not in {None, "gold", "silver", "bronze", "none"}:
+                    raise ValueError("The export contains an invalid trophy frame.")
+                numeric_values = []
+                for key in ("rest_count", "pulse_count", "planned_count"):
+                    value = target.get(key)
+                    if value is None:
+                        numeric_values.append(None)
+                    else:
+                        try:
+                            value = int(value)
+                        except (TypeError, ValueError) as error:
+                            raise ValueError("The export contains invalid trophy totals.") from error
+                        if value < 0:
+                            raise ValueError("The export contains invalid trophy totals.")
+                        numeric_values.append(value)
+                completed_at = _validated_import_timestamp(
+                    target.get("completed_at"), "completion time"
+                )
+                cancelled_at = _validated_import_timestamp(
+                    target.get("cancelled_at"), "cancellation time"
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO trophy_targets (
+                        series_id, series_name_snapshot, start_date, target_date,
+                        trophy_key, random_choice, status, completed_at,
+                        cancelled_at, rest_count, pulse_count, planned_count,
+                        frame, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_series_id,
+                        _bounded_import_text(
+                            target.get("series_name_snapshot") or imported_name,
+                            "series name snapshot", SERIES_NAME_MAX_LENGTH
+                        ),
+                        start_date.isoformat(), target_date.isoformat(), trophy_key,
+                        int(bool(target.get("random_choice"))), status, completed_at,
+                        cancelled_at, *numeric_values, frame,
+                        str(target.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+                    ),
+                )
+                required_dates = target.get("required_dates") or []
+                if not isinstance(required_dates, list):
+                    raise ValueError("The export contains invalid trophy target days.")
+                normalized_dates = []
+                for required_date in required_dates:
+                    parsed = _validated_import_date(required_date, "trophy target day")
+                    if parsed < start_date or parsed > target_date:
+                        raise ValueError("A trophy target day is outside its target range.")
+                    normalized_dates.append(parsed.isoformat())
+                if len(normalized_dates) != len(set(normalized_dates)):
+                    raise ValueError("The export contains duplicate trophy target days.")
+                connection.executemany(
+                    "INSERT INTO trophy_target_days (target_id, required_date) VALUES (?, ?)",
+                    [(cursor.lastrowid, value) for value in normalized_dates],
                 )
             imported_names.append(imported_name)
     return imported_names
@@ -506,7 +1533,16 @@ def create_series(name):
             (name,),
         )
 
-        return cursor.lastrowid
+        series_id = cursor.lastrowid
+        connection.execute(
+            """
+            INSERT INTO series_schedule_versions (
+                series_id, effective_from, schedule_type, schedule_days
+            ) VALUES (?, ?, 'daily', '0,1,2,3,4,5,6')
+            """,
+            (series_id, date.today().isoformat()),
+        )
+        return series_id
 
 
 def rename_series(series_id, name):
@@ -565,7 +1601,7 @@ def save_setting(setting_key, setting_value):
         )
 
 
-def get_pulse_dates(series_id):
+def get_pulse_dates(series_id, include_inactive=False):
     with connect_database() as connection:
         rows = connection.execute(
             """
@@ -577,7 +1613,18 @@ def get_pulse_dates(series_id):
             (series_id,),
         ).fetchall()
 
-    return [date.fromisoformat(row[0]) for row in rows]
+    pulse_dates = [date.fromisoformat(row[0]) for row in rows]
+    if include_inactive:
+        return pulse_dates
+
+    # Keep the physical record when a completed day is later changed to an
+    # OFF DAY, but exclude it from every visible statistic and timeline. If
+    # that date becomes a pulse day again, the stored completion reappears.
+    return [
+        pulse_day
+        for pulse_day in pulse_dates
+        if is_scheduled_day(series_id, pulse_day)
+    ]
 
 
 def get_pulse_entries(series_id):
@@ -650,6 +1697,8 @@ def update_pulse_note(series_id, pulse_date, note):
 
 
 def pulse_exists_today(series_id):
+    if not is_scheduled_day(series_id, date.today()):
+        return False
     today = date.today().isoformat()
 
     with connect_database() as connection:
@@ -680,23 +1729,25 @@ def undo_today_pulse(series_id, keep_note=True):
 
 
 def is_scheduled_day(series_id, day_value, pulse_dates=None):
-    details = get_series_details(series_id)
-    if not details:
-        return True
-    schedule_type = details[4]
+    with connect_database() as connection:
+        override = connection.execute(
+            """
+            SELECT is_scheduled
+            FROM series_date_overrides
+            WHERE series_id = ? AND override_date = ?
+            """,
+            (series_id, day_value.isoformat()),
+        ).fetchone()
+    if override is not None:
+        return bool(override[0])
+
+    schedule_type, schedule_days, _ = get_schedule_for_day(series_id, day_value)
     if schedule_type == "daily":
         return True
     if schedule_type == "weekdays":
-        selected = {int(value) for value in (details[5] or "").split(",") if value}
+        selected = {int(value) for value in (schedule_days or "").split(",") if value}
         return day_value.weekday() in selected
-    target = max(1, min(7, int(details[6] or 1)))
-    pulse_dates = pulse_dates if pulse_dates is not None else get_pulse_dates(series_id)
-    week_start = day_value - timedelta(days=day_value.weekday())
-    pulses_through_day = sum(
-        week_start <= pulse_day <= day_value
-        for pulse_day in pulse_dates
-    )
-    return pulses_through_day < target or day_value in set(pulse_dates)
+    return True
 
 
 def scheduled_misses_between(series_id, start_day, end_day, pulse_dates):
@@ -762,6 +1813,11 @@ def calculate_stats(pulse_dates, series_id=None):
 
 def get_pulse_status(pulse_dates, series_id=None):
     if not pulse_dates:
+        if (
+            series_id is not None
+            and not is_scheduled_day(series_id, date.today(), pulse_dates)
+        ):
+            return "ALIVE", "OFF DAY - no pulse is planned for today."
         return "NO PULSE", "This series has not received a pulse yet."
 
     today = date.today()
@@ -788,7 +1844,7 @@ def get_pulse_status(pulse_dates, series_id=None):
     # OFF DAY zinciri kendi başına değiştirmez. Ancak daha önce kaçırılmış
     # planlı günler varsa mevcut REST / FLATLINE durumu korunur.
     if missed_days == 0 and not today_is_scheduled:
-        return "ALIVE", "OFF DAY — your chain is safe today."
+        return "ALIVE", "OFF DAY - your chain is safe today."
 
     if missed_days == 0:
         return "ALIVE", "Waiting for today's pulse."
@@ -832,10 +1888,20 @@ def main(page: ft.Page):
     )
     status_text = ft.Text("", color="#FF5D73")
 
-    pulse_heart = ft.Text(
-        "♥",
+    def heart_button_content(label):
+        return ft.Row(
+            controls=[
+                ft.Icon(ft.Icons.FAVORITE, size=18),
+                ft.Text(label, weight=ft.FontWeight.BOLD),
+            ],
+            tight=True,
+            spacing=7,
+            alignment=ft.MainAxisAlignment.CENTER,
+        )
+
+    pulse_heart = ft.Icon(
+        ft.Icons.FAVORITE,
         size=72,
-        weight=ft.FontWeight.BOLD,
     )
 
     pulse_state_text = ft.Text(
@@ -865,6 +1931,160 @@ def main(page: ft.Page):
         border=ft.Border.all(1, "#252B38"),
         border_radius=20,
     )
+
+    frame_colors = {
+        "gold": "#FFD45C",
+        "silver": "#C9D0DA",
+        "bronze": "#C88752",
+        "none": "#343A48",
+    }
+
+    def target_trophy_icon(icon_name):
+        icons = {
+            "favorite": ft.Icons.FAVORITE,
+            "local_fire_department": ft.Icons.LOCAL_FIRE_DEPARTMENT,
+            "star": ft.Icons.STAR,
+            "shield": ft.Icons.SHIELD_OUTLINED,
+            "auto_awesome": ft.Icons.AUTO_AWESOME,
+            "emoji_events": ft.Icons.EMOJI_EVENTS,
+        }
+        return icons.get(icon_name, ft.Icons.EMOJI_EVENTS)
+
+    today_target_icon = ft.Icon(ft.Icons.EMOJI_EVENTS, size=42, color="#FFC857")
+    today_target_name = ft.Text(weight=ft.FontWeight.BOLD, size=15)
+    today_target_details = ft.Text(size=12, color="#A9B0BF")
+    today_target_card = ft.Container(
+        content=ft.Row(
+            controls=[
+                today_target_icon,
+                ft.Column(
+                    controls=[today_target_name, today_target_details],
+                    spacing=3,
+                    expand=True,
+                ),
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        width=700,
+        padding=14,
+        bgcolor="#151923",
+        border=ft.Border.all(1, "#343A48"),
+        border_radius=14,
+        visible=False,
+    )
+
+    history_target_icon = ft.Icon(ft.Icons.EMOJI_EVENTS, size=64, color="#72798A")
+    history_target_title = ft.Text(
+        "NO ACTIVE TROPHY TARGET", size=16, weight=ft.FontWeight.BOLD
+    )
+    history_target_status = ft.Text(size=12, color="#A9B0BF")
+    history_target_numbers = ft.Text(size=12, color="#D7DBE5")
+    history_target_frame = ft.Text(size=11, weight=ft.FontWeight.BOLD)
+    history_target_progress = ft.ProgressBar(
+        value=0,
+        color="#FFC857",
+        bgcolor="#252B38",
+        height=8,
+    )
+    history_create_target_button = ft.Button(
+        content="CREATE TROPHY TARGET",
+        icon=ft.Icons.EMOJI_EVENTS,
+        on_click=lambda e: open_series_profile(e),
+    )
+    history_target_card = ft.Container(
+        content=ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        history_target_icon,
+                        ft.Column(
+                            controls=[
+                                history_target_title,
+                                history_target_status,
+                                history_target_frame,
+                            ],
+                            spacing=3,
+                            expand=True,
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                history_target_progress,
+                history_target_numbers,
+                history_create_target_button,
+            ],
+            spacing=10,
+        ),
+        width=674,
+        padding=18,
+        bgcolor="#151923",
+        border=ft.Border.all(1, "#343A48"),
+        border_radius=16,
+    )
+
+    def refresh_target_cards():
+        progress = get_active_trophy_progress(selected_series_id())
+        if progress is None:
+            today_target_card.visible = False
+            history_target_icon.name = ft.Icons.EMOJI_EVENTS
+            history_target_icon.color = "#72798A"
+            history_target_title.value = "NO ACTIVE TROPHY TARGET"
+            history_target_status.value = (
+                "Choose a future date and keep the signal alive to earn a trophy."
+            )
+            history_target_frame.value = ""
+            history_target_numbers.value = ""
+            history_target_progress.value = 0
+            history_target_progress.visible = False
+            history_create_target_button.visible = True
+            history_target_card.border = ft.Border.all(1, "#343A48")
+            return
+
+        trophy_name, icon_name, trophy_color = TROPHY_DEFINITIONS.get(
+            progress["trophy_key"], TROPHY_DEFINITIONS["classic"]
+        )
+        frame = progress["frame"]
+        frame_color = frame_colors[frame]
+        frame_label = "FRAMELESS" if frame == "none" else f"{frame.upper()} FRAME"
+
+        today_target_card.visible = True
+        today_target_card.border = ft.Border.all(2, frame_color)
+        today_target_icon.name = target_trophy_icon(icon_name)
+        today_target_icon.color = trophy_color
+        today_target_name.value = trophy_name
+        today_target_details.value = (
+            f"{progress['calendar_days_left']} calendar days left | "
+            f"{progress['pulse_count']}/{progress['required_pulses']} Pulses | "
+            f"{progress['remaining_pulses']} remaining\n"
+            f"{progress['planned_total']} planned days | "
+            f"{progress['rest_count']} REST | {frame_label}"
+        )
+
+        history_target_icon.name = target_trophy_icon(icon_name)
+        history_target_icon.color = trophy_color
+        history_target_title.value = trophy_name
+        history_target_status.value = (
+            f"{progress['start_date'].isoformat()} to "
+            f"{progress['target_date'].isoformat()} | "
+            f"{progress['calendar_days_left']} calendar days left"
+        )
+        history_target_frame.value = (
+            f"CURRENT REWARD: {frame_label} | "
+            f"{progress['rest_count']} REST"
+        )
+        history_target_frame.color = frame_color
+        history_target_numbers.value = (
+            f"Progress: {progress['pulse_count']} of "
+            f"{progress['required_pulses']} required Pulses "
+            f"({round(progress['progress'] * 100)}%)\n"
+            f"Original planned Pulse days: {progress['planned_total']} | "
+            f"Remaining Pulses: {progress['remaining_pulses']}"
+        )
+        history_target_progress.value = progress["progress"]
+        history_target_progress.color = frame_color
+        history_target_progress.visible = True
+        history_create_target_button.visible = False
+        history_target_card.border = ft.Border.all(2, frame_color)
 
     series_title = ft.Text(
         size=22,
@@ -905,7 +2125,7 @@ def main(page: ft.Page):
     )
 
     record_button = ft.Button(
-        content="♥ RECORD PULSE",
+        content=heart_button_content("RECORD PULSE"),
         width=240,
         height=48,
     )
@@ -978,12 +2198,6 @@ def main(page: ft.Page):
         size=13,
         color="#8D95A5",
         weight=ft.FontWeight.BOLD,
-    )
-
-    history_hint = ft.Text(
-        "Click a day to view progress",
-        size=11,
-        color="#72798A",
     )
 
     history_canvas = cv.Canvas(
@@ -1065,11 +2279,6 @@ def main(page: ft.Page):
         "selected_day": date.today(),
     }
 
-    calendar_month_title = ft.Text(
-        size=20,
-        weight=ft.FontWeight.BOLD,
-        color="#F4F6FA",
-    )
     calendar_month_picker = ft.Dropdown(
         width=145,
         value=str(date.today().month),
@@ -1100,7 +2309,7 @@ def main(page: ft.Page):
         label="NOTE",
         multiline=True,
         min_lines=2,
-        max_lines=6,
+        max_lines=None,
         width=660,
         border_color="#343A48",
         focused_border_color="#FF3158",
@@ -1115,9 +2324,15 @@ def main(page: ft.Page):
 
     def get_history_day_state(selected_date, pulse_dates):
         if selected_date > date.today():
-            return "FUTURE", "#343A48"
+            if is_scheduled_day(selected_series_id(), selected_date, pulse_dates):
+                return "PLANNED", "#72798A"
+            return "OFF DAY", "#72798A"
 
         if not pulse_dates:
+            if not is_scheduled_day(
+                selected_series_id(), selected_date, pulse_dates
+            ):
+                return "OFF DAY", "#56C8FF"
             if selected_date == date.today():
                 return "NO PULSE", "#72798A"
             return "NOT STARTED", "#4B5261"
@@ -1160,7 +2375,7 @@ def main(page: ft.Page):
             return "OFF DAY", "#56C8FF"
 
         if selected_date == date.today():
-            return "ALIVE — WAITING TODAY", "#FF3158"
+            return "ALIVE - WAITING TODAY", "#FF3158"
 
         if previous_pulse is None:
             return "NOT STARTED", "#4B5261"
@@ -1203,9 +2418,6 @@ def main(page: ft.Page):
             day_value,
             pulse_dates,
         )
-        if day_value > date.today():
-            day_color = "#252B38"
-
         return cv.Path(
             elements=path_elements,
             paint=ft.Paint(
@@ -1282,7 +2494,12 @@ def main(page: ft.Page):
         selected_date = calendar_state["selected_day"]
         pulse_dates = get_pulse_dates(selected_series_id())
         notes_by_date = get_daily_notes(selected_series_id())
-        calendar_month_title.value = shown_month.strftime("%B %Y").upper()
+        active_target = get_active_trophy_progress(selected_series_id())
+        target_date = (
+            active_target["target_date"] if active_target is not None else None
+        )
+        calendar_month_picker.value = str(shown_month.month)
+        calendar_year_picker.value = str(shown_month.year)
 
         first_weekday = 6 if get_setting("week_start") == "sunday" else 0
         month_calendar = calendar.Calendar(firstweekday=first_weekday)
@@ -1323,19 +2540,21 @@ def main(page: ft.Page):
                 in_month = day_value.month == shown_month.month
                 is_today = day_value == date.today()
                 is_selected = day_value == selected_date
+                is_target = day_value == target_date
                 day_state, day_color = get_history_day_state(
                     day_value,
                     pulse_dates,
                 )
                 cell_state_labels = {
                     "PULSE RECORDED": "PULSE",
-                    "ALIVE — WAITING TODAY": "WAITING",
+                    "ALIVE - WAITING TODAY": "WAITING",
                     "NOT STARTED": "NOT STARTED",
                     "NO PULSE": "NO PULSE",
                     "REVIVE": "REVIVE",
                     "REST": "REST",
                     "FLATLINE": "FLATLINE",
                     "FUTURE": "FUTURE",
+                    "PLANNED": "PLANNED",
                     "OFF DAY": "OFF DAY",
                 }
                 cell_state = cell_state_labels.get(day_state, day_state)
@@ -1386,6 +2605,14 @@ def main(page: ft.Page):
                                     top=6,
                                     visible=bool(notes_by_date.get(day_value, "").strip()),
                                 ),
+                                ft.Icon(
+                                    ft.Icons.EMOJI_EVENTS,
+                                    size=13,
+                                    color="#FFD45C",
+                                    right=6,
+                                    bottom=4,
+                                    visible=is_target,
+                                ),
                             ]
                         ),
                         width=96,
@@ -1396,8 +2623,10 @@ def main(page: ft.Page):
                             else "#0B0E14"
                         ),
                         border=ft.Border.all(
-                            2 if is_selected else 1,
-                            "#F4F6FA" if is_selected else "#1B2230",
+                            2 if is_selected or is_target else 1,
+                            "#FFD45C" if is_target
+                            else "#F4F6FA" if is_selected
+                            else "#1B2230",
                         ),
                         tooltip=day_value.isoformat(),
                         ink=True,
@@ -1511,45 +2740,71 @@ def main(page: ft.Page):
         for offset in range(14):
             current_day = first_day + timedelta(days=offset)
             has_pulse = current_day in pulse_date_set
+            is_off_day = not is_scheduled_day(
+                selected_series_id(),
+                current_day,
+                pulse_dates,
+            )
             is_today = current_day == today
             start_x = offset * slot_width
             end_x = start_x + slot_width
 
-            path_elements = [
-                cv.Path.MoveTo(x=start_x, y=baseline_y)
-            ]
-
-            if has_pulse:
-                points = [
-                    (start_x + 8, baseline_y),
-                    (start_x + 14, baseline_y),
-                    (start_x + 18, baseline_y - 10),
-                    (start_x + 22, baseline_y + 13),
-                    (start_x + 27, baseline_y - 36),
-                    (start_x + 32, baseline_y + 27),
-                    (start_x + 38, baseline_y),
-                    (end_x, baseline_y),
-                ]
-            else:
-                points = [(end_x, baseline_y)]
-
-            for x, y in points:
-                path_elements.append(
-                    cv.Path.LineTo(x=x, y=y)
-                )
-
-            shapes.append(
-                cv.Path(
-                    elements=path_elements,
-                    paint=ft.Paint(
-                        color=line_color,
-                        stroke_width=3,
-                        style=ft.PaintingStyle.STROKE,
-                        stroke_cap=ft.StrokeCap.ROUND,
-                        stroke_join=ft.StrokeJoin.ROUND,
-                    ),
-                )
+            signal_paint = ft.Paint(
+                color=line_color,
+                stroke_width=3,
+                style=ft.PaintingStyle.STROKE,
+                stroke_cap=ft.StrokeCap.ROUND,
+                stroke_join=ft.StrokeJoin.ROUND,
             )
+
+            if is_off_day:
+                # OFF DAY keeps the EKG's current status colour, but its
+                # horizontal section is dashed so the 14-day line remains
+                # visually continuous without looking like a required day.
+                dash_length = 6
+                gap_length = 4
+                dash_start = start_x
+                while dash_start < end_x:
+                    shapes.append(
+                        cv.Line(
+                            x1=dash_start,
+                            y1=baseline_y,
+                            x2=min(dash_start + dash_length, end_x),
+                            y2=baseline_y,
+                            paint=signal_paint,
+                        )
+                    )
+                    dash_start += dash_length + gap_length
+            else:
+                path_elements = [
+                    cv.Path.MoveTo(x=start_x, y=baseline_y)
+                ]
+
+                if has_pulse:
+                    points = [
+                        (start_x + 8, baseline_y),
+                        (start_x + 14, baseline_y),
+                        (start_x + 18, baseline_y - 10),
+                        (start_x + 22, baseline_y + 13),
+                        (start_x + 27, baseline_y - 36),
+                        (start_x + 32, baseline_y + 27),
+                        (start_x + 38, baseline_y),
+                        (end_x, baseline_y),
+                    ]
+                else:
+                    points = [(end_x, baseline_y)]
+
+                for x, y in points:
+                    path_elements.append(
+                        cv.Path.LineTo(x=x, y=y)
+                    )
+
+                shapes.append(
+                    cv.Path(
+                        elements=path_elements,
+                        paint=signal_paint,
+                    )
+                )
 
             if is_today:
                 shapes.append(
@@ -1718,6 +2973,7 @@ def main(page: ft.Page):
         )
         history_canvas.shapes = history_shapes
         history_labels.controls = history_day_labels
+        refresh_target_cards()
 
         if pulse_exists_today(series_id):
             note_field.value = get_today_note(series_id)
@@ -1727,7 +2983,7 @@ def main(page: ft.Page):
             undo_pulse_button.visible = True
 
             record_button.disabled = True
-            record_button.content = "♥ PULSE RECORDED"
+            record_button.content = heart_button_content("PULSE RECORDED")
             record_button.style = ft.ButtonStyle(
                 bgcolor="#303542",
                 color="#8D95A5",
@@ -1745,11 +3001,11 @@ def main(page: ft.Page):
             record_button.disabled = not scheduled_today
 
             if not scheduled_today:
-                record_button.content = "OFF DAY — NO PULSE TODAY"
+                record_button.content = "OFF DAY - NO PULSE TODAY"
             elif pulse_state == "FLATLINE":
-                record_button.content = "♥ REVIVE"
+                record_button.content = heart_button_content("REVIVE")
             else:
-                record_button.content = "♥ RECORD PULSE"
+                record_button.content = heart_button_content("RECORD PULSE")
 
             record_button.style = ft.ButtonStyle(
                 bgcolor=(
@@ -1782,7 +3038,7 @@ def main(page: ft.Page):
         pulse_dates_before = get_pulse_dates(series_id)
 
         if not is_scheduled_day(series_id, date.today(), pulse_dates_before):
-            status_text.value = "OFF DAY — no pulse is planned for today."
+            status_text.value = "OFF DAY - no pulse is planned for today."
             status_text.color = "#56C8FF"
             page.update()
             return
@@ -1830,12 +3086,13 @@ def main(page: ft.Page):
         build_dashboard()
 
         if was_flatline:
-            status_text.value = "♥ Pulse revived."
+            status_text.value = "\u2665 Pulse revived."
         else:
-            status_text.value = "♥ Pulse recorded."
+            status_text.value = "\u2665 Pulse recorded."
 
         page.update()
         schedule_status_clear()
+        maybe_show_earned_trophy()
 
     def start_note_edit(e):
         note_field.read_only = False
@@ -1861,6 +3118,7 @@ def main(page: ft.Page):
         build_notes()
         build_dashboard()
         page.update()
+        maybe_show_earned_trophy()
         schedule_status_clear()
 
     keep_undo_note = ft.Checkbox(
@@ -2111,6 +3369,12 @@ def main(page: ft.Page):
         label="Description", multiline=True, min_lines=2, max_lines=4
     )
     profile_goal = ft.TextField(label="Goal", hint_text="Read at least 20 minutes")
+    schedule_effective_date = ft.TextField(
+        label="New plan starts on (YYYY-MM-DD)",
+        value=date.today().isoformat(),
+        hint_text=date.today().isoformat(),
+        expand=True,
+    )
     schedule_mode = ft.RadioGroup(
         value="daily",
         content=ft.Column(
@@ -2170,6 +3434,558 @@ def main(page: ft.Page):
         content=ft.Text(size=12, color="#D7DBE5"),
     )
     profile_message = ft.Text(size=12)
+    schedule_history_list = ft.Column(spacing=4)
+    override_date_field = ft.TextField(
+        label="Specific date (YYYY-MM-DD)",
+        value=date.today().isoformat(),
+        hint_text=date.today().isoformat(),
+        expand=True,
+    )
+    override_mode = ft.RadioGroup(
+        value="pulse",
+        content=ft.Row(
+            controls=[
+                ft.Radio(value="pulse", label="Pulse day"),
+                ft.Radio(value="off", label="OFF DAY"),
+            ],
+            wrap=True,
+        ),
+    )
+    upcoming_overrides_list = ft.Column(spacing=4)
+    selected_override_dates = set()
+    override_selection_summary = ft.Text(
+        "No dates selected.", size=12, color="#8D95A5"
+    )
+    exception_calendar_state = {
+        "month": date.today().replace(day=1),
+    }
+    exception_calendar_title = ft.Text(
+        size=16, weight=ft.FontWeight.BOLD, color="#F4F6FA"
+    )
+    exception_calendar_grid = ft.Column(spacing=4)
+
+    trophy_target_date = ft.TextField(
+        label="Target date (YYYY-MM-DD)",
+        value=(date.today() + timedelta(days=30)).isoformat(),
+        expand=True,
+    )
+    trophy_picker = ft.Dropdown(
+        label="Trophy reward",
+        value="random",
+        options=[
+            ft.DropdownOption(key="random", text="Random trophy")
+        ] + [
+            ft.DropdownOption(key=key, text=details[0])
+            for key, details in TROPHY_DEFINITIONS.items()
+        ],
+    )
+    trophy_targets_list = ft.Column(spacing=8)
+    trophy_target_message = ft.Text(
+        size=12,
+        color="#FF5D73",
+        visible=False,
+    )
+
+    def picked_date_text(value):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                return value.astimezone().date().isoformat()
+            # Web DatePicker may return local midnight as a naive UTC value
+            # (for Turkey, 00:00 becomes 21:00 on the previous day). Moving
+            # to noon recovers the calendar date without storing a time.
+            if value.time() != datetime.min.time():
+                value = value + timedelta(hours=12)
+            return value.date().isoformat()
+        return value.strftime("%Y-%m-%d")
+
+    def apply_schedule_start_date(e):
+        selected = picked_date_text(e.control.value)
+        if selected:
+            schedule_effective_date.value = selected
+            page.update()
+
+    def apply_override_date(e):
+        selected = picked_date_text(e.control.value)
+        if selected:
+            override_date_field.value = selected
+            page.update()
+
+    picker_first_date = datetime.combine(date.today(), datetime.min.time()).replace(
+        hour=12
+    )
+    picker_last_date = picker_first_date + timedelta(days=3650)
+    schedule_start_picker = ft.DatePicker(
+        value=picker_first_date,
+        first_date=picker_first_date,
+        last_date=picker_last_date,
+        on_change=apply_schedule_start_date,
+    )
+    override_date_picker = ft.DatePicker(
+        value=picker_first_date,
+        first_date=picker_first_date,
+        last_date=picker_last_date,
+        on_change=apply_override_date,
+    )
+
+    def apply_trophy_target_date(e):
+        selected = picked_date_text(e.control.value)
+        if selected:
+            trophy_target_date.value = selected
+            page.update()
+
+    trophy_target_picker = ft.DatePicker(
+        value=picker_first_date + timedelta(days=30),
+        first_date=picker_first_date + timedelta(days=1),
+        last_date=picker_last_date,
+        on_change=apply_trophy_target_date,
+    )
+
+    def open_schedule_start_picker(e):
+        try:
+            selected = date.fromisoformat(schedule_effective_date.value)
+        except (TypeError, ValueError):
+            selected = date.today()
+        schedule_start_picker.value = datetime.combine(
+            selected, datetime.min.time()
+        ).replace(hour=12)
+        page.show_dialog(schedule_start_picker)
+
+    def open_override_date_picker(e):
+        try:
+            selected = date.fromisoformat(override_date_field.value)
+        except (TypeError, ValueError):
+            selected = date.today()
+        override_date_picker.value = datetime.combine(
+            selected, datetime.min.time()
+        ).replace(hour=12)
+        page.show_dialog(override_date_picker)
+
+    def open_trophy_target_picker(e):
+        try:
+            selected = date.fromisoformat(trophy_target_date.value)
+        except (TypeError, ValueError):
+            selected = date.today() + timedelta(days=30)
+        trophy_target_picker.value = datetime.combine(
+            selected, datetime.min.time()
+        ).replace(hour=12)
+        page.show_dialog(trophy_target_picker)
+
+    def refresh_exception_selection_summary():
+        selected = sorted(selected_override_dates)
+        if not selected:
+            override_selection_summary.value = "No dates selected."
+            override_selection_summary.color = "#8D95A5"
+        else:
+            override_selection_summary.value = (
+                f"{len(selected)} date(s) selected: "
+                + ", ".join(day.strftime("%d %b") for day in selected)
+            )
+            override_selection_summary.color = "#56C8FF"
+
+    def toggle_exception_calendar_day(picked_day):
+        if picked_day < date.today():
+            return
+        if picked_day in selected_override_dates:
+            selected_override_dates.remove(picked_day)
+        else:
+            selected_override_dates.add(picked_day)
+        build_exception_calendar()
+        refresh_exception_selection_summary()
+        page.update()
+
+    def build_exception_calendar():
+        shown_month = exception_calendar_state["month"]
+        exception_calendar_title.value = shown_month.strftime("%B %Y").upper()
+        month_builder = calendar.Calendar(firstweekday=0)
+        rows = []
+        rows.append(
+            ft.Row(
+                controls=[
+                    ft.Container(
+                        content=ft.Text(
+                            label,
+                            size=10,
+                            color="#8D95A5",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        width=50,
+                        alignment=ft.Alignment.CENTER,
+                    )
+                    for label in ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+                ],
+                spacing=2,
+            )
+        )
+        for week in month_builder.monthdatescalendar(
+            shown_month.year, shown_month.month
+        ):
+            controls = []
+            for day_value in week:
+                in_month = day_value.month == shown_month.month
+                selectable = in_month and day_value >= date.today()
+                selected = day_value in selected_override_dates
+                controls.append(
+                    ft.TextButton(
+                        content=str(day_value.day) if in_month else "",
+                        width=50,
+                        height=38,
+                        disabled=not selectable,
+                        style=ft.ButtonStyle(
+                            bgcolor="#FF3158" if selected else "#151923",
+                            color=(
+                                "#FFFFFF" if selected
+                                else "#D7DBE5" if selectable
+                                else "#555D6D"
+                            ),
+                            padding=0,
+                        ),
+                        on_click=(
+                            lambda e, picked=day_value:
+                            toggle_exception_calendar_day(picked)
+                        ) if selectable else None,
+                    )
+                )
+            rows.append(ft.Row(controls=controls, spacing=2))
+        exception_calendar_grid.controls = rows
+
+    def move_exception_calendar_month(offset):
+        current = exception_calendar_state["month"]
+        month_index = current.year * 12 + current.month - 1 + offset
+        target = date(month_index // 12, month_index % 12 + 1, 1)
+        if target < date.today().replace(day=1):
+            return
+        exception_calendar_state["month"] = target
+        build_exception_calendar()
+        page.update()
+
+    def clear_exception_selection(e):
+        selected_override_dates.clear()
+        build_exception_calendar()
+        refresh_exception_selection_summary()
+        page.update()
+
+    def close_exception_calendar(e):
+        refresh_exception_selection_summary()
+        page.pop_dialog()
+        page.update()
+
+    exception_multi_calendar_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Choose exception dates"),
+        content=ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.IconButton(
+                            icon=ft.Icons.CHEVRON_LEFT,
+                            on_click=lambda e: move_exception_calendar_month(-1),
+                        ),
+                        exception_calendar_title,
+                        ft.IconButton(
+                            icon=ft.Icons.CHEVRON_RIGHT,
+                            on_click=lambda e: move_exception_calendar_month(1),
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                exception_calendar_grid,
+                override_selection_summary,
+            ],
+            width=380,
+            tight=True,
+            spacing=10,
+        ),
+        actions=[
+            ft.TextButton(content="CLEAR", on_click=clear_exception_selection),
+            ft.Button(content="USE SELECTED DATES", on_click=close_exception_calendar),
+        ],
+    )
+
+    def open_exception_multi_calendar(e):
+        exception_calendar_state["month"] = date.today().replace(day=1)
+        build_exception_calendar()
+        refresh_exception_selection_summary()
+        page.show_dialog(exception_multi_calendar_dialog)
+
+    def format_schedule(schedule_type, schedule_days):
+        if schedule_type == "daily":
+            return "Every day"
+        labels = [
+            "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
+        ]
+        selected = {
+            int(value) for value in (schedule_days or "").split(",") if value
+        }
+        return ", ".join(labels[index] for index in range(7) if index in selected)
+
+    def refresh_schedule_history():
+        rows = get_schedule_versions(selected_series_id())
+        schedule_history_list.controls = [
+            ft.Text(
+                f"From {effective_from}: {format_schedule(mode, days)}",
+                size=12,
+                color="#A9B0BF",
+            )
+            for effective_from, mode, days in rows
+        ] or [ft.Text("No schedule history.", size=12, color="#8D95A5")]
+
+    def remove_override(override_date):
+        try:
+            delete_date_override(selected_series_id(), override_date)
+        except ValueError as error:
+            profile_message.value = str(error)
+            profile_message.color = "#FF5D73"
+            page.update()
+            return
+        refresh_upcoming_overrides()
+        build_calendar()
+        build_dashboard()
+        page.update()
+
+    def refresh_upcoming_overrides():
+        today = date.today()
+        rows = get_date_overrides(selected_series_id())
+        past_rows = [
+            row for row in rows if date.fromisoformat(row[0]) < today
+        ]
+        current_and_future_rows = [
+            row for row in rows if date.fromisoformat(row[0]) >= today
+        ]
+
+        controls = []
+        if current_and_future_rows:
+            controls.append(
+                ft.Text(
+                    "TODAY & UPCOMING",
+                    size=11,
+                    weight=ft.FontWeight.BOLD,
+                    color="#A9B0BF",
+                )
+            )
+            controls.extend(
+                ft.Row(
+                    controls=[
+                        ft.Text(
+                            f"{override_date} - "
+                            f"{'PULSE DAY' if is_scheduled else 'OFF DAY'}",
+                            expand=True,
+                            size=12,
+                            color="#56C8FF" if is_scheduled else "#8D95A5",
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.DELETE_OUTLINE,
+                            tooltip="Remove exception",
+                            on_click=(
+                                lambda e, picked_date=override_date:
+                                remove_override(picked_date)
+                            ),
+                        ),
+                    ]
+                )
+                for override_date, is_scheduled in current_and_future_rows
+            )
+
+        if past_rows:
+            controls.append(
+                ft.Text(
+                    "PAST EXCEPTIONS",
+                    size=11,
+                    weight=ft.FontWeight.BOLD,
+                    color="#A9B0BF",
+                )
+            )
+            controls.extend(
+                ft.Text(
+                    f"{override_date} - "
+                    f"{'PULSE DAY' if is_scheduled else 'OFF DAY'}",
+                    size=12,
+                    color="#707887",
+                )
+                for override_date, is_scheduled in reversed(past_rows)
+            )
+
+        upcoming_overrides_list.controls = controls or [
+            ft.Text("No date exceptions.", size=12, color="#8D95A5")
+        ]
+
+    def add_date_override(e):
+        try:
+            set_date_overrides(
+                selected_series_id(),
+                selected_override_dates,
+                override_mode.value == "pulse",
+            )
+        except ValueError as error:
+            profile_message.value = str(error)
+            profile_message.color = "#FF5D73"
+            page.update()
+            return
+        saved_count = len(selected_override_dates)
+        profile_message.value = f"{saved_count} date exception(s) saved."
+        profile_message.color = "#35D07F"
+        selected_override_dates.clear()
+        refresh_exception_selection_summary()
+        refresh_upcoming_overrides()
+        refresh_screen()
+        build_calendar()
+        build_dashboard()
+        page.update()
+
+    def trophy_icon(icon_name):
+        icons = {
+            "favorite": ft.Icons.FAVORITE,
+            "local_fire_department": ft.Icons.LOCAL_FIRE_DEPARTMENT,
+            "star": ft.Icons.STAR,
+            "shield": ft.Icons.SHIELD_OUTLINED,
+            "auto_awesome": ft.Icons.AUTO_AWESOME,
+            "emoji_events": ft.Icons.EMOJI_EVENTS,
+        }
+        return icons.get(icon_name, ft.Icons.EMOJI_EVENTS)
+
+    def remove_trophy_target(target_id):
+        cancel_active_trophy_target(target_id, selected_series_id())
+        profile_message.value = "Trophy target cancelled. The attempt was saved."
+        profile_message.color = "#A9B0BF"
+        refresh_trophy_targets_list()
+        refresh_target_cards()
+        build_calendar()
+        page.update()
+
+    def refresh_trophy_targets_list():
+        rows = get_trophy_targets(selected_series_id())
+        controls = []
+        frame_colors = {
+            "gold": "#FFD45C",
+            "silver": "#C9D0DA",
+            "bronze": "#C88752",
+            "none": "#343A48",
+            None: "#343A48",
+        }
+        status_colors = {
+            "active": "#56C8FF",
+            "earned": "#35D07F",
+            "failed": "#72798A",
+            "cancelled": "#72798A",
+        }
+        for (
+            target_id, series_snapshot, start_text, target_text,
+            trophy_key, random_choice, status, completed_at,
+            rest_count, pulse_count, planned_count, frame,
+        ) in rows:
+            trophy_name, icon_name, trophy_color = TROPHY_DEFINITIONS.get(
+                trophy_key, TROPHY_DEFINITIONS["classic"]
+            )
+            if status == "active":
+                start_day = date.fromisoformat(start_text)
+                target_day = date.fromisoformat(target_text)
+                progress_end = min(target_day, date.today() - timedelta(days=1))
+                if progress_end >= start_day:
+                    planned, pulses, rests, _ = _trophy_target_metrics(
+                        selected_series_id(), start_day, progress_end, target_id
+                    )
+                else:
+                    planned, pulses, rests = 0, 0, 0
+                days_left = max(0, (target_day - date.today()).days)
+                detail = (
+                    f"{start_text} to {target_text} | {days_left} days left\n"
+                    f"{pulses}/{planned} planned Pulses | {rests} REST"
+                )
+            else:
+                frame_label = (frame or "none").upper()
+                detail = (
+                    f"{start_text} to {target_text}\n"
+                    f"{pulse_count or 0}/{planned_count or 0} planned Pulses | "
+                    f"{rest_count or 0} REST | {frame_label} FRAME"
+                )
+
+            controls.append(
+                ft.Container(
+                    content=ft.Row(
+                        controls=[
+                            ft.Icon(
+                                trophy_icon(icon_name),
+                                size=38,
+                                color=trophy_color,
+                            ),
+                            ft.Column(
+                                controls=[
+                                    ft.Text(
+                                        trophy_name + (" (RANDOM)" if random_choice else ""),
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    ft.Text(
+                                        status.upper(),
+                                        size=10,
+                                        color=status_colors[status],
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    ft.Text(detail, size=11, color="#A9B0BF"),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE_OUTLINE,
+                                tooltip="Remove active target",
+                                visible=status == "active",
+                                on_click=(
+                                    lambda e, picked_id=target_id:
+                                    remove_trophy_target(picked_id)
+                                ),
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    padding=10,
+                    border=ft.Border.all(2 if status == "earned" else 1, frame_colors[frame]),
+                    border_radius=12,
+                    bgcolor="#151923",
+                )
+            )
+        trophy_targets_list.controls = controls or [
+            ft.Text("No trophy targets yet.", size=12, color="#8D95A5")
+        ]
+
+    async def clear_trophy_target_message_later(expected_message):
+        await asyncio.sleep(4)
+        if trophy_target_message.value == expected_message:
+            trophy_target_message.value = ""
+            trophy_target_message.visible = False
+            page.update()
+
+    def show_temporary_trophy_target_message(message):
+        trophy_target_message.value = message
+        trophy_target_message.visible = True
+        page.update()
+        page.run_task(clear_trophy_target_message_later, message)
+
+    def add_trophy_target(e):
+        if get_active_trophy_target(selected_series_id()) is not None:
+            show_temporary_trophy_target_message(
+                "You already have an active target, so you can't create a new "
+                "one. Remove your current target or complete it before creating "
+                "another target."
+            )
+            return
+        try:
+            create_trophy_target(
+                selected_series_id(),
+                (trophy_target_date.value or "").strip(),
+                trophy_picker.value or "random",
+            )
+        except ValueError as error:
+            show_temporary_trophy_target_message(str(error))
+            return
+        trophy_target_message.value = ""
+        trophy_target_message.visible = False
+        profile_message.value = "Trophy target started. Keep the signal alive."
+        profile_message.color = "#35D07F"
+        refresh_trophy_targets_list()
+        refresh_target_cards()
+        build_calendar()
+        page.update()
 
     def selected_weekday_names():
         return [
@@ -2215,16 +4031,32 @@ def main(page: ft.Page):
             profile_message.color = "#FF5D73"
             page.update()
             return
+        chosen_days = (
+            ",".join(selected_days)
+            if schedule_mode.value == "weekdays"
+            else "0,1,2,3,4,5,6"
+        )
+        try:
+            effective_from = date.fromisoformat(
+                (schedule_effective_date.value or "").strip()
+            )
+            save_series_schedule(
+                selected_series_id(),
+                effective_from,
+                schedule_mode.value,
+                chosen_days,
+            )
+        except ValueError as error:
+            profile_message.value = str(error)
+            profile_message.color = "#FF5D73"
+            page.update()
+            return
         update_series_profile(
             selected_series_id(),
             profile_description.value or "",
             profile_goal.value or "",
             schedule_mode.value,
-            (
-                ",".join(selected_days)
-                if schedule_mode.value == "weekdays"
-                else "0,1,2,3,4,5,6"
-            ),
+            chosen_days,
             7,
         )
         page.pop_dialog()
@@ -2238,20 +4070,84 @@ def main(page: ft.Page):
         title=ft.Text("Series settings"),
         content=ft.Column(
             controls=[
-                profile_description,
-                profile_goal,
+                ft.Text("TROPHY TARGET", size=13, weight=ft.FontWeight.BOLD),
+                ft.Text(
+                    "Choose a future date and a trophy reward. You earn it if "
+                    "this series does not FLATLINE before the target. The final "
+                    "frame is Gold with 0 REST, Silver with 1, Bronze with 2, "
+                    "and frameless with 3 or more REST days.",
+                    size=12,
+                    color="#A9B0BF",
+                ),
+                ft.Row(
+                    controls=[
+                        trophy_target_date,
+                        ft.IconButton(
+                            icon=ft.Icons.CALENDAR_MONTH,
+                            tooltip="Choose trophy target date",
+                            on_click=open_trophy_target_picker,
+                        ),
+                    ]
+                ),
+                trophy_picker,
+                ft.Button(
+                    content="START TROPHY TARGET",
+                    icon=ft.Icons.EMOJI_EVENTS,
+                    on_click=add_trophy_target,
+                ),
+                trophy_target_message,
+                trophy_targets_list,
+                ft.Divider(),
                 ft.Text(
                     "PULSE SCHEDULE",
                     size=13,
                     weight=ft.FontWeight.BOLD,
                 ),
+                ft.Text(
+                    "Changing the plan does not rewrite earlier dates. The new "
+                    "weekly plan applies from the selected date forward.",
+                    size=12,
+                    color="#A9B0BF",
+                ),
+                ft.Row(
+                    controls=[
+                        schedule_effective_date,
+                        ft.IconButton(
+                            icon=ft.Icons.CALENDAR_MONTH,
+                            tooltip="Choose start date",
+                            on_click=open_schedule_start_picker,
+                        ),
+                    ]
+                ),
                 schedule_mode,
                 weekday_section,
                 schedule_summary,
+                ft.Text("PLAN HISTORY", size=13, weight=ft.FontWeight.BOLD),
+                schedule_history_list,
+                ft.Divider(),
+                ft.Text("SPECIFIC DATE EXCEPTIONS", size=13, weight=ft.FontWeight.BOLD),
+                ft.Text(
+                    "Select one or more dates from today onward and apply the "
+                    "same exception in one step. "
+                    "A Pulse day requires the habit; OFF DAY protects the chain. "
+                    "Past exceptions remain visible as locked history.",
+                    size=12,
+                    color="#A9B0BF",
+                ),
+                ft.Button(
+                    content="SELECT EXCEPTION DATES",
+                    icon=ft.Icons.CALENDAR_MONTH,
+                    on_click=open_exception_multi_calendar,
+                ),
+                override_selection_summary,
+                override_mode,
+                ft.Button(content="SAVE SELECTED EXCEPTIONS", on_click=add_date_override),
+                upcoming_overrides_list,
                 profile_message,
             ],
             width=500,
-            tight=True,
+            height=650,
+            scroll=ft.ScrollMode.AUTO,
             spacing=10,
         ),
         actions=[
@@ -2264,14 +4160,28 @@ def main(page: ft.Page):
         details = get_series_details(selected_series_id())
         profile_description.value = details[2]
         profile_goal.value = details[3]
-        schedule_mode.value = (
-            "weekdays" if details[4] == "weekdays" else "daily"
+        current_schedule = get_schedule_for_day(
+            selected_series_id(), date.today()
         )
-        selected_days = set((details[5] or "").split(","))
+        schedule_mode.value = (
+            "weekdays" if current_schedule[0] == "weekdays" else "daily"
+        )
+        selected_days = set((current_schedule[1] or "").split(","))
         for index, checkbox in enumerate(weekday_checks):
             checkbox.value = str(index) in selected_days
+        schedule_effective_date.value = date.today().isoformat()
+        selected_override_dates.clear()
+        refresh_exception_selection_summary()
+        override_mode.value = "pulse"
+        trophy_target_date.value = (date.today() + timedelta(days=30)).isoformat()
+        trophy_picker.value = "random"
+        trophy_target_message.value = ""
+        trophy_target_message.visible = False
         profile_message.value = ""
         refresh_schedule_editor()
+        refresh_schedule_history()
+        refresh_upcoming_overrides()
+        refresh_trophy_targets_list()
         page.show_dialog(series_profile_dialog)
 
     record_button.on_click = record_pulse
@@ -2369,7 +4279,6 @@ def main(page: ft.Page):
                 ft.Column(
                     controls=[
                         history_title,
-                        history_hint,
                     ],
                     spacing=2,
                     horizontal_alignment=(
@@ -2377,6 +4286,7 @@ def main(page: ft.Page):
                     ),
                 ),
                 history_monitor,
+                today_target_card,
         ],
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         spacing=18,
@@ -2402,13 +4312,23 @@ def main(page: ft.Page):
     calendar_month_picker.on_select = jump_calendar_date
     calendar_year_picker.on_select = jump_calendar_date
 
+    def legend_item(icon, label, color):
+        return ft.Row(
+            controls=[
+                ft.Icon(icon, color=color, size=12),
+                ft.Text(label, color=color, size=11),
+            ],
+            tight=True,
+            spacing=4,
+        )
+
     history_legend = ft.Row(
         controls=[
-            ft.Text("● Pulse", color="#FF3158", size=11),
-            ft.Text("● Rest", color="#F5A623", size=11),
-            ft.Text("● Flatline", color="#72798A", size=11),
-            ft.Text("● Revive", color="#35D07F", size=11),
-            ft.Text("▣ Note", color="#56C8FF", size=11),
+            legend_item(ft.Icons.CIRCLE, "Pulse", "#FF3158"),
+            legend_item(ft.Icons.CIRCLE, "Rest", "#F5A623"),
+            legend_item(ft.Icons.CIRCLE, "Flatline", "#72798A"),
+            legend_item(ft.Icons.CIRCLE, "Revive", "#35D07F"),
+            legend_item(ft.Icons.NOTE_ALT_OUTLINED, "Note", "#56C8FF"),
         ],
         alignment=ft.MainAxisAlignment.CENTER,
         spacing=12,
@@ -2424,20 +4344,21 @@ def main(page: ft.Page):
                         tooltip="Previous month",
                         on_click=lambda e: change_calendar_month(-1),
                     ),
-                    calendar_month_title,
+                    calendar_month_picker,
+                    calendar_year_picker,
                     ft.IconButton(
                         icon=ft.Icons.CHEVRON_RIGHT,
                         tooltip="Next month",
                         on_click=lambda e: change_calendar_month(1),
                     ),
                     ft.Button(
-                        content="TODAY",
+                        content="GO TODAY",
                         on_click=return_calendar_to_today,
                     ),
-                    calendar_month_picker,
-                    calendar_year_picker,
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=8,
                 wrap=True,
             ),
             ft.Text(
@@ -2496,6 +4417,7 @@ def main(page: ft.Page):
                 border=ft.Border.all(1, "#252B38"),
                 border_radius=16,
             ),
+            history_target_card,
         ],
         visible=False,
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -2566,7 +4488,7 @@ def main(page: ft.Page):
         raw_state, color = get_history_day_state(day_value, pulse_dates)
         if raw_state == "PULSE RECORDED":
             return "ALIVE", color
-        if raw_state == "ALIVE — WAITING TODAY":
+        if raw_state == "ALIVE - WAITING TODAY":
             return "ALIVE", color
         if raw_state == "NO PULSE":
             return "FLATLINE", color
@@ -2830,6 +4752,279 @@ def main(page: ft.Page):
         spacing=14,
     )
 
+    collection_summary = ft.Text(size=12, color="#A9B0BF")
+    collection_shelves = ft.Column(spacing=24)
+
+    def share_earned_trophy(target_id):
+        try:
+            share_path = create_trophy_share_card(target_id)
+        except (OSError, ValueError) as error:
+            page.show_dialog(
+                ft.AlertDialog(
+                    title=ft.Text("SHARE CARD"),
+                    content=ft.Text(str(error)),
+                    actions=[ft.TextButton(content="Close", on_click=lambda e: page.pop_dialog())],
+                )
+            )
+            return
+        page.pop_dialog()
+        page.show_dialog(
+            ft.AlertDialog(
+                title=ft.Text("SHARE CARD READY"),
+                content=ft.Column(
+                    controls=[
+                        ft.Icon(ft.Icons.IMAGE_OUTLINED, size=44, color="#56C8FF"),
+                        ft.Text(share_path.name, weight=ft.FontWeight.BOLD),
+                        ft.Text(
+                            "Your trophy card was saved as a PNG. You can share it "
+                            "through social media, messaging or e-mail.",
+                            color="#A9B0BF",
+                            size=12,
+                        ),
+                    ],
+                    tight=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                actions=[
+                    ft.TextButton(
+                        content="OPEN FOLDER",
+                        on_click=lambda e: open_exports_folder(),
+                    ),
+                    ft.Button(content="DONE", on_click=lambda e: page.pop_dialog()),
+                ],
+            )
+        )
+
+    def open_trophy_detail(trophy_row, celebration=False):
+        (
+            target_id, series_id, series_snapshot, start_text, target_text,
+            trophy_key, completed_at, rest_count, pulse_count,
+            planned_count, frame,
+        ) = trophy_row
+        trophy_name, icon_name, trophy_color = TROPHY_DEFINITIONS.get(
+            trophy_key, TROPHY_DEFINITIONS["classic"]
+        )
+        display_frame = frame or "none"
+        frame_color = frame_colors.get(display_frame, "#343A48")
+        frame_label = (
+            "FRAMELESS" if display_frame == "none"
+            else f"{display_frame.upper()} FRAME"
+        )
+        dialog = ft.AlertDialog(
+            title=ft.Text(
+                "TROPHY EARNED!" if celebration else "TROPHY DETAILS",
+                text_align=ft.TextAlign.CENTER,
+            ),
+            content=ft.Column(
+                controls=[
+                    ft.Container(
+                        content=ft.Icon(
+                            trophy_icon(icon_name), size=82, color=trophy_color
+                        ),
+                        width=150,
+                        height=150,
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor="#151923",
+                        border=ft.Border.all(5, frame_color),
+                        border_radius=75,
+                    ),
+                    ft.Text(trophy_name, size=24, weight=ft.FontWeight.BOLD),
+                    ft.Text(series_snapshot, size=15, color="#A9B0BF"),
+                    ft.Text(
+                        frame_label,
+                        weight=ft.FontWeight.BOLD,
+                        color=frame_color,
+                    ),
+                    ft.Divider(color="#252B38"),
+                    ft.Text(
+                        f"{start_text} to {target_text}\n"
+                        f"{pulse_count or 0}/{planned_count or 0} planned Pulses | "
+                        f"{rest_count or 0} REST",
+                        text_align=ft.TextAlign.CENTER,
+                        color="#A9B0BF",
+                    ),
+                    ft.Text(
+                        "The signal stayed alive. This trophy now has a permanent "
+                        "place in your collection.",
+                        size=12,
+                        text_align=ft.TextAlign.CENTER,
+                        color="#35D07F",
+                    ),
+                ],
+                width=390,
+                tight=True,
+                spacing=10,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            actions=[
+                ft.TextButton(
+                    content="SHARE CARD",
+                    icon=ft.Icons.SHARE_OUTLINED,
+                    on_click=lambda e, picked_id=target_id: share_earned_trophy(picked_id),
+                ),
+                ft.Button(
+                    content="VIEW ON SHELF",
+                    on_click=lambda e: (page.pop_dialog(), show_section("collection")),
+                ),
+            ],
+        )
+        page.show_dialog(dialog)
+
+    def build_collection_trophy(trophy_row):
+        (
+            target_id, series_id, series_snapshot, start_text, target_text,
+            trophy_key, completed_at, rest_count, pulse_count,
+            planned_count, frame,
+        ) = trophy_row
+        trophy_name, icon_name, trophy_color = TROPHY_DEFINITIONS.get(
+            trophy_key, TROPHY_DEFINITIONS["classic"]
+        )
+        display_frame = frame or "none"
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Container(
+                        content=ft.Icon(
+                            trophy_icon(icon_name), size=54, color=trophy_color
+                        ),
+                        width=94,
+                        height=94,
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor="#11151F",
+                        border=ft.Border.all(
+                            4, frame_colors.get(display_frame, "#343A48")
+                        ),
+                        border_radius=47,
+                    ),
+                    ft.Text(
+                        trophy_name,
+                        size=12,
+                        weight=ft.FontWeight.BOLD,
+                        text_align=ft.TextAlign.CENTER,
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                    ft.Text(
+                        series_snapshot,
+                        size=10,
+                        color="#8D95A5",
+                        text_align=ft.TextAlign.CENTER,
+                        max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                    ft.Text(
+                        target_text,
+                        size=9,
+                        color="#72798A",
+                    ),
+                ],
+                spacing=4,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            width=190,
+            padding=12,
+            border_radius=14,
+            ink=True,
+            tooltip="Open trophy details",
+            on_click=lambda e, row=trophy_row: open_trophy_detail(row),
+        )
+
+    def empty_trophy_slot():
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Icon(ft.Icons.LOCK_OUTLINE, size=32, color="#343A48"),
+                    ft.Text("EMPTY SPOT", size=9, color="#4A5060"),
+                ],
+                spacing=6,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            width=190,
+            height=145,
+            alignment=ft.Alignment.CENTER,
+        )
+
+    def build_collection():
+        trophies = get_earned_trophies()
+        gold_count = sum(1 for row in trophies if row[10] == "gold")
+        collection_summary.value = (
+            f"{len(trophies)} earned trophies · {gold_count} gold frames"
+            if trophies else
+            "Complete a trophy target to place your first reward on the shelf."
+        )
+        shelf_controls = []
+        visible_slots = max(3, ((len(trophies) + 2) // 3) * 3)
+        slots = [
+            build_collection_trophy(trophies[index])
+            if index < len(trophies) else empty_trophy_slot()
+            for index in range(visible_slots)
+        ]
+        for start in range(0, len(slots), 3):
+            shelf_controls.append(
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Row(
+                                controls=slots[start:start + 3],
+                                alignment=ft.MainAxisAlignment.SPACE_AROUND,
+                                vertical_alignment=ft.CrossAxisAlignment.END,
+                            ),
+                            ft.Container(
+                                height=14,
+                                bgcolor="#7B4B2A",
+                                border=ft.Border.all(2, "#B8783E"),
+                                border_radius=4,
+                                shadow=ft.BoxShadow(
+                                    blur_radius=10,
+                                    offset=ft.Offset(0, 7),
+                                    color="#55000000",
+                                ),
+                            ),
+                        ],
+                        spacing=0,
+                    ),
+                    width=674,
+                    padding=ft.Padding.only(left=12, right=12, top=8),
+                )
+            )
+        collection_shelves.controls = shelf_controls
+
+    collection_view = ft.Column(
+        controls=[
+            ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.EMOJI_EVENTS, size=32, color="#FFC857"),
+                    ft.Column(
+                        controls=[
+                            ft.Text("TROPHY COLLECTION", size=24, weight=ft.FontWeight.BOLD),
+                            collection_summary,
+                        ],
+                        spacing=1,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+            ),
+            ft.Text(
+                "Every trophy remembers the series, target and effort that earned it.",
+                size=12,
+                color="#72798A",
+                text_align=ft.TextAlign.CENTER,
+            ),
+            collection_shelves,
+        ],
+        visible=False,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=18,
+    )
+
+    def maybe_show_earned_trophy():
+        trophy = get_uncelebrated_earned_trophy()
+        if trophy is None:
+            return
+        mark_trophy_celebrated(trophy[0])
+        build_collection()
+        open_trophy_detail(trophy, celebration=True)
+
     dashboard_filter = ft.Dropdown(
         label="Show",
         width=190,
@@ -2902,7 +5097,7 @@ def main(page: ft.Page):
         if not is_scheduled_day(
             series_id, date.today(), get_pulse_dates(series_id)
         ):
-            status_text.value = "OFF DAY — no pulse is planned for today."
+            status_text.value = "OFF DAY - no pulse is planned for today."
             status_text.color = "#56C8FF"
             page.update()
             return
@@ -2929,6 +5124,7 @@ def main(page: ft.Page):
         build_notes()
         build_dashboard()
         page.update()
+        maybe_show_earned_trophy()
 
     def open_series_today(series_id):
         series_dropdown.value = str(series_id)
@@ -2961,6 +5157,25 @@ def main(page: ft.Page):
         scheduled_today = is_scheduled_day(
             series_id, date.today(), pulse_dates
         )
+        dashboard_target = get_active_trophy_progress(series_id)
+        has_active_trophy_target = dashboard_target is not None
+        if dashboard_target is not None:
+            remaining_target_pulses = dashboard_target["remaining_pulses"]
+            target_short_text = (
+                "TARGET READY"
+                if remaining_target_pulses == 0
+                else "1 PULSE LEFT"
+                if remaining_target_pulses == 1
+                else f"{remaining_target_pulses} PULSES LEFT"
+            )
+            target_tooltip = (
+                f"{dashboard_target['pulse_count']}/"
+                f"{dashboard_target['required_pulses']} Pulses | "
+                f"{dashboard_target['calendar_days_left']} calendar days left"
+            )
+        else:
+            target_short_text = ""
+            target_tooltip = ""
         note_control = ft.TextField(
             hint_text="What did you accomplish today?",
             value=get_today_note(series_id),
@@ -2977,13 +5192,13 @@ def main(page: ft.Page):
 
         action_button = ft.Button(
             content=(
-                "♥ PULSE RECORDED"
+                heart_button_content("PULSE RECORDED")
                 if completed_today
                 else "OFF DAY"
                 if not scheduled_today
-                else "♥ REVIVE"
+                else heart_button_content("REVIVE")
                 if state_name == "FLATLINE"
-                else "♥ RECORD PULSE"
+                else heart_button_content("RECORD PULSE")
             ),
             disabled=completed_today or not scheduled_today,
             on_click=(
@@ -3018,10 +5233,40 @@ def main(page: ft.Page):
                                 ],
                                 spacing=2,
                             ),
-                            ft.IconButton(
-                                icon=ft.Icons.OPEN_IN_NEW,
-                                tooltip="Open series",
-                                on_click=lambda e, sid=series_id: open_series_today(sid),
+                            ft.Row(
+                                controls=[
+                                    ft.Container(
+                                        content=ft.Row(
+                                            controls=[
+                                                ft.Icon(
+                                                    ft.Icons.EMOJI_EVENTS,
+                                                    size=20,
+                                                    color="#FFD45C",
+                                                ),
+                                                ft.Text(
+                                                    target_short_text,
+                                                    size=10,
+                                                    color="#FFD45C",
+                                                    weight=ft.FontWeight.BOLD,
+                                                ),
+                                            ],
+                                            spacing=4,
+                                            tight=True,
+                                        ),
+                                        tooltip=target_tooltip,
+                                        visible=has_active_trophy_target,
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.OPEN_IN_NEW,
+                                        tooltip="Open series",
+                                        on_click=(
+                                            lambda e, sid=series_id:
+                                            open_series_today(sid)
+                                        ),
+                                    ),
+                                ],
+                                spacing=2,
+                                tight=True,
                             ),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -3085,12 +5330,19 @@ def main(page: ft.Page):
         series_rows = get_series()
         dashboard_data = []
         completed_count = 0
+        scheduled_count = 0
         for series_id, series_name in series_rows:
             pulse_dates = get_pulse_dates(series_id)
             state_name, _, _ = dashboard_display_state(series_id, pulse_dates)
+            scheduled_today = is_scheduled_day(
+                series_id, date.today(), pulse_dates
+            )
             completed = pulse_exists_today(series_id)
-            completed_count += int(completed)
-            if dashboard_filter.value == "waiting" and completed:
+            scheduled_count += int(scheduled_today)
+            completed_count += int(completed and scheduled_today)
+            if dashboard_filter.value == "waiting" and (
+                completed or not scheduled_today
+            ):
                 continue
             if dashboard_filter.value == "completed" and not completed:
                 continue
@@ -3120,16 +5372,19 @@ def main(page: ft.Page):
             for series_id, series_name, _ in dashboard_data
         ]
         dashboard_summary.value = (
-            f"{completed_count} of {len(series_rows)} series completed today · "
-            f"{len(series_rows) - completed_count} waiting"
+            f"{completed_count} of {scheduled_count} planned series completed today · "
+            f"{scheduled_count - completed_count} waiting · "
+            f"{len(series_rows) - scheduled_count} OFF DAY"
         )
         dashboard_completion_message.value = (
             "All pulses recorded for today."
-            if series_rows and completed_count == len(series_rows)
+            if scheduled_count and completed_count == scheduled_count
+            else "No pulses planned for today."
+            if series_rows and scheduled_count == 0
             else ""
         )
         dashboard_progress.value = (
-            completed_count / len(series_rows) if series_rows else 0
+            completed_count / scheduled_count if scheduled_count else 0
         )
         if not series_rows:
             dashboard_cards.controls = [
@@ -3300,6 +5555,7 @@ def main(page: ft.Page):
             ft.DropdownOption(key="today", text="Today"),
             ft.DropdownOption(key="history", text="History"),
             ft.DropdownOption(key="notes", text="Notes"),
+            ft.DropdownOption(key="collection", text="Collection"),
         ],
     )
     week_start_setting = ft.Dropdown(
@@ -3342,7 +5598,7 @@ def main(page: ft.Page):
         ] + [
             ft.DropdownOption(
                 key=f"series:{series_id}",
-                text=f"{name}{' — archived' if archived else ''}",
+                text=f"{name}{' - archived' if archived else ''}",
             )
             for series_id, name, archived in rows
         ]
@@ -3544,6 +5800,7 @@ def main(page: ft.Page):
     today_tab = ft.Button(content="TODAY")
     history_tab = ft.Button(content="HISTORY")
     notes_tab = ft.Button(content="NOTES")
+    collection_tab = ft.Button(content="COLLECTION")
 
     series_management_row = ft.Row(
         controls=[
@@ -3560,16 +5817,18 @@ def main(page: ft.Page):
     )
 
     def show_section(section_name):
-        series_management_row.visible = section_name != "dashboard"
+        series_management_row.visible = section_name not in {"dashboard", "collection"}
         dashboard_view.visible = section_name == "dashboard"
         today_view.visible = section_name == "today"
         history_view.visible = section_name == "history"
         notes_view.visible = section_name == "notes"
+        collection_view.visible = section_name == "collection"
         for button, name in [
             (dashboard_tab, "dashboard"),
             (today_tab, "today"),
             (history_tab, "history"),
             (notes_tab, "notes"),
+            (collection_tab, "collection"),
         ]:
             button.style = ft.ButtonStyle(
                 bgcolor="#FF3158" if name == section_name else "#151923",
@@ -3585,12 +5844,16 @@ def main(page: ft.Page):
             build_notes()
         if section_name == "dashboard":
             build_dashboard()
+        if section_name == "collection":
+            build_collection()
         page.update()
+        maybe_show_earned_trophy()
 
     dashboard_tab.on_click = lambda e: show_section("dashboard")
     today_tab.on_click = lambda e: show_section("today")
     history_tab.on_click = lambda e: show_section("history")
     notes_tab.on_click = lambda e: show_section("notes")
+    collection_tab.on_click = lambda e: show_section("collection")
 
     build_notes()
     build_dashboard()
@@ -3599,45 +5862,66 @@ def main(page: ft.Page):
         ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Row(
+                    ft.Stack(
+                        width=712,
+                        height=52,
                         controls=[
-                            ft.Container(width=44),
-                            ft.Text(
-                                "THE PULSE",
-                                size=36,
-                                weight=ft.FontWeight.BOLD,
-                                color="#F4F6FA",
+                            ft.Container(
+                                content=ft.Text(
+                                    "THE PULSE",
+                                    size=36,
+                                    weight=ft.FontWeight.BOLD,
+                                    color="#F4F6FA",
+                                    text_align=ft.TextAlign.CENTER,
+                                ),
+                                left=0,
+                                right=0,
+                                top=0,
+                                alignment=ft.Alignment.TOP_CENTER,
                             ),
-                            ft.IconButton(
-                                icon=ft.Icons.HELP_OUTLINE,
-                                tooltip="Help",
-                                on_click=open_help,
-                            ),
-                            ft.IconButton(
-                                icon=ft.Icons.SETTINGS_OUTLINED,
-                                tooltip="Settings",
-                                on_click=open_settings,
+                            ft.Container(
+                                content=ft.Row(
+                                    controls=[
+                                        ft.IconButton(
+                                            icon=ft.Icons.HELP_OUTLINE,
+                                            tooltip="Help",
+                                            on_click=open_help,
+                                        ),
+                                        ft.IconButton(
+                                            icon=ft.Icons.SETTINGS_OUTLINED,
+                                            tooltip="Settings",
+                                            on_click=open_settings,
+                                        ),
+                                    ],
+                                    spacing=6,
+                                    tight=True,
+                                ),
+                                right=0,
+                                top=0,
                             ),
                         ],
-                        alignment=ft.MainAxisAlignment.CENTER,
                     ),
                     ft.Text(
                         "Keep it alive.",
                         size=14,
                         color="#72798A",
                     ),
-                    series_management_row,
                     ft.Row(
-                        controls=[dashboard_tab, today_tab, history_tab, notes_tab],
+                        controls=[
+                            dashboard_tab, today_tab, history_tab,
+                            notes_tab, collection_tab,
+                        ],
                         alignment=ft.MainAxisAlignment.CENTER,
                         spacing=8,
                         wrap=True,
                     ),
+                    series_management_row,
                     ft.Divider(color="#252B38"),
                     dashboard_view,
                     today_view,
                     history_view,
                     notes_view,
+                    collection_view,
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=18,
