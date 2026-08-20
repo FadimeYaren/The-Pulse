@@ -556,6 +556,31 @@ def set_date_overrides(series_id, override_dates, is_scheduled):
             ],
         )
 
+def set_mixed_date_overrides(series_id, assignments):
+    """Save required and free-day exceptions together in one transaction."""
+    if not assignments:
+        raise ValueError("Mark at least one date before saving.")
+    parsed = []
+    for raw_date, is_scheduled in assignments.items():
+        parsed_date = date.fromisoformat(str(raw_date))
+        if parsed_date < date.today():
+            raise ValueError("Past days cannot be changed.")
+        parsed.append(
+            (series_id, parsed_date.isoformat(), int(bool(is_scheduled)))
+        )
+    with connect_database() as connection:
+        connection.executemany(
+            """
+            INSERT INTO series_date_overrides (
+                series_id, override_date, is_scheduled
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(series_id, override_date) DO UPDATE SET
+                is_scheduled = excluded.is_scheduled,
+                created_at = CURRENT_TIMESTAMP
+            """,
+            parsed,
+        )
+
 
 def create_trophy_target(series_id, target_date, trophy_key):
     parsed_target = date.fromisoformat(str(target_date))
@@ -3441,18 +3466,28 @@ def main(page: ft.Page):
         hint_text=date.today().isoformat(),
         expand=True,
     )
-    override_mode = ft.RadioGroup(
-        value="pulse",
-        content=ft.Row(
+    upcoming_overrides_list = ft.Column(spacing=4)
+    pending_exception_changes = {}
+    exception_mark_mode = ft.RadioGroup(
+        value="required",
+        content=ft.Column(
             controls=[
-                ft.Radio(value="pulse", label="Pulse day"),
-                ft.Radio(value="off", label="OFF DAY"),
+                ft.Radio(
+                    value="required",
+                    label="Required day — completing the habit will be expected",
+                ),
+                ft.Radio(
+                    value="free",
+                    label="Free day — no action is required and the chain is protected",
+                ),
+                ft.Radio(
+                    value="clear",
+                    label="Remove mark from this selection",
+                ),
             ],
-            wrap=True,
+            spacing=3,
         ),
     )
-    upcoming_overrides_list = ft.Column(spacing=4)
-    selected_override_dates = set()
     override_selection_summary = ft.Text(
         "No dates selected.", size=12, color="#8D95A5"
     )
@@ -3573,24 +3608,44 @@ def main(page: ft.Page):
         page.show_dialog(trophy_target_picker)
 
     def refresh_exception_selection_summary():
-        selected = sorted(selected_override_dates)
-        if not selected:
-            override_selection_summary.value = "No dates selected."
+        if not pending_exception_changes:
+            override_selection_summary.value = "No changes prepared."
             override_selection_summary.color = "#8D95A5"
         else:
+            required = sorted(
+                day for day, is_required in pending_exception_changes.items()
+                if is_required
+            )
+            free = sorted(
+                day for day, is_required in pending_exception_changes.items()
+                if not is_required
+            )
+            details = []
+            if required:
+                details.append(
+                    f"{len(required)} required: "
+                    + ", ".join(day.strftime("%d %b") for day in required)
+                )
+            if free:
+                details.append(
+                    f"{len(free)} free: "
+                    + ", ".join(day.strftime("%d %b") for day in free)
+                )
             override_selection_summary.value = (
-                f"{len(selected)} date(s) selected: "
-                + ", ".join(day.strftime("%d %b") for day in selected)
+                f"{len(pending_exception_changes)} change(s) prepared\n"
+                + "\n".join(details)
             )
             override_selection_summary.color = "#56C8FF"
 
     def toggle_exception_calendar_day(picked_day):
         if picked_day < date.today():
             return
-        if picked_day in selected_override_dates:
-            selected_override_dates.remove(picked_day)
+        if exception_mark_mode.value == "clear":
+            pending_exception_changes.pop(picked_day, None)
         else:
-            selected_override_dates.add(picked_day)
+            pending_exception_changes[picked_day] = (
+                exception_mark_mode.value == "required"
+            )
         build_exception_calendar()
         refresh_exception_selection_summary()
         page.update()
@@ -3625,7 +3680,9 @@ def main(page: ft.Page):
             for day_value in week:
                 in_month = day_value.month == shown_month.month
                 selectable = in_month and day_value >= date.today()
-                selected = day_value in selected_override_dates
+                selection = pending_exception_changes.get(day_value)
+                selected = day_value in pending_exception_changes
+                selected_color = "#FF3158" if selection else "#56C8FF"
                 controls.append(
                     ft.TextButton(
                         content=str(day_value.day) if in_month else "",
@@ -3633,7 +3690,7 @@ def main(page: ft.Page):
                         height=38,
                         disabled=not selectable,
                         style=ft.ButtonStyle(
-                            bgcolor="#FF3158" if selected else "#151923",
+                            bgcolor=selected_color if selected else "#151923",
                             color=(
                                 "#FFFFFF" if selected
                                 else "#D7DBE5" if selectable
@@ -3661,7 +3718,7 @@ def main(page: ft.Page):
         page.update()
 
     def clear_exception_selection(e):
-        selected_override_dates.clear()
+        pending_exception_changes.clear()
         build_exception_calendar()
         refresh_exception_selection_summary()
         page.update()
@@ -3673,9 +3730,24 @@ def main(page: ft.Page):
 
     exception_multi_calendar_dialog = ft.AlertDialog(
         modal=True,
-        title=ft.Text("Choose exception dates"),
+        title=ft.Text("Plan specific dates"),
         content=ft.Column(
             controls=[
+                ft.Text(
+                    "Choose what a click should mean, then mark as many dates as "
+                    "you need. You can switch modes at any time before saving.",
+                    size=12,
+                    color="#A9B0BF",
+                ),
+                exception_mark_mode,
+                ft.Row(
+                    controls=[
+                        ft.Text("● Required", color="#FF3158", size=11),
+                        ft.Text("● Free", color="#56C8FF", size=11),
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=18,
+                ),
                 ft.Row(
                     controls=[
                         ft.IconButton(
@@ -3693,18 +3765,19 @@ def main(page: ft.Page):
                 exception_calendar_grid,
                 override_selection_summary,
             ],
-            width=380,
+            width=430,
             tight=True,
             spacing=10,
         ),
         actions=[
             ft.TextButton(content="CLEAR", on_click=clear_exception_selection),
-            ft.Button(content="USE SELECTED DATES", on_click=close_exception_calendar),
+            ft.Button(content="REVIEW CHANGES", on_click=close_exception_calendar),
         ],
     )
 
     def open_exception_multi_calendar(e):
         exception_calendar_state["month"] = date.today().replace(day=1)
+        exception_mark_mode.value = "required"
         build_exception_calendar()
         refresh_exception_selection_summary()
         page.show_dialog(exception_multi_calendar_dialog)
@@ -3769,7 +3842,7 @@ def main(page: ft.Page):
                     controls=[
                         ft.Text(
                             f"{override_date} - "
-                            f"{'PULSE DAY' if is_scheduled else 'OFF DAY'}",
+                            f"{'REQUIRED DAY' if is_scheduled else 'FREE DAY'}",
                             expand=True,
                             size=12,
                             color="#56C8FF" if is_scheduled else "#8D95A5",
@@ -3799,7 +3872,7 @@ def main(page: ft.Page):
             controls.extend(
                 ft.Text(
                     f"{override_date} - "
-                    f"{'PULSE DAY' if is_scheduled else 'OFF DAY'}",
+                    f"{'REQUIRED DAY' if is_scheduled else 'FREE DAY'}",
                     size=12,
                     color="#707887",
                 )
@@ -3812,20 +3885,19 @@ def main(page: ft.Page):
 
     def add_date_override(e):
         try:
-            set_date_overrides(
+            set_mixed_date_overrides(
                 selected_series_id(),
-                selected_override_dates,
-                override_mode.value == "pulse",
+                pending_exception_changes,
             )
         except ValueError as error:
             profile_message.value = str(error)
             profile_message.color = "#FF5D73"
             page.update()
             return
-        saved_count = len(selected_override_dates)
+        saved_count = len(pending_exception_changes)
         profile_message.value = f"{saved_count} date exception(s) saved."
         profile_message.color = "#35D07F"
-        selected_override_dates.clear()
+        pending_exception_changes.clear()
         refresh_exception_selection_summary()
         refresh_upcoming_overrides()
         refresh_screen()
@@ -4046,6 +4118,10 @@ def main(page: ft.Page):
                 schedule_mode.value,
                 chosen_days,
             )
+            if pending_exception_changes:
+                set_mixed_date_overrides(
+                    selected_series_id(), pending_exception_changes
+                )
         except ValueError as error:
             profile_message.value = str(error)
             profile_message.color = "#FF5D73"
@@ -4059,6 +4135,7 @@ def main(page: ft.Page):
             chosen_days,
             7,
         )
+        pending_exception_changes.clear()
         page.pop_dialog()
         refresh_screen()
         build_calendar()
@@ -4127,21 +4204,24 @@ def main(page: ft.Page):
                 ft.Divider(),
                 ft.Text("SPECIFIC DATE EXCEPTIONS", size=13, weight=ft.FontWeight.BOLD),
                 ft.Text(
-                    "Select one or more dates from today onward and apply the "
-                    "same exception in one step. "
-                    "A Pulse day requires the habit; OFF DAY protects the chain. "
-                    "Past exceptions remain visible as locked history.",
+                    "Prepare required and free dates together. In the calendar, "
+                    "choose what each click means, switch modes whenever needed, "
+                    "then save the whole batch in one step. Past changes remain "
+                    "visible as locked history.",
                     size=12,
                     color="#A9B0BF",
                 ),
                 ft.Button(
-                    content="SELECT EXCEPTION DATES",
+                    content="PLAN SPECIFIC DATES",
                     icon=ft.Icons.CALENDAR_MONTH,
                     on_click=open_exception_multi_calendar,
                 ),
                 override_selection_summary,
-                override_mode,
-                ft.Button(content="SAVE SELECTED EXCEPTIONS", on_click=add_date_override),
+                ft.Text(
+                    "Prepared changes will be applied when you press Save below.",
+                    size=11,
+                    color="#A9B0BF",
+                ),
                 upcoming_overrides_list,
                 profile_message,
             ],
@@ -4170,9 +4250,9 @@ def main(page: ft.Page):
         for index, checkbox in enumerate(weekday_checks):
             checkbox.value = str(index) in selected_days
         schedule_effective_date.value = date.today().isoformat()
-        selected_override_dates.clear()
+        pending_exception_changes.clear()
         refresh_exception_selection_summary()
-        override_mode.value = "pulse"
+        exception_mark_mode.value = "required"
         trophy_target_date.value = (date.today() + timedelta(days=30)).isoformat()
         trophy_picker.value = "random"
         trophy_target_message.value = ""
@@ -5429,85 +5509,248 @@ def main(page: ft.Page):
         spacing=14,
     )
 
-    help_content = ft.Column(
-        controls=[
-            ft.Text("THE PULSE BASICS", size=18, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "A series is a task or habit you want to keep alive. "
-                "Record one pulse on every day you complete it."
+    help_topics = [
+        {
+            "title": "QUICK START",
+            "icon": ft.Icons.ROCKET_LAUNCH_OUTLINED,
+            "color": "#56C8FF",
+            "keywords": "start begin create series record today first steps",
+            "body": (
+                "1. Create a series for one habit or task you want to keep alive.\n\n"
+                "2. Choose which days require the habit. You can use every day, "
+                "selected weekdays, or specific-date changes.\n\n"
+                "3. On a required day, record one Pulse after completing the habit. "
+                "Use Dashboard for all series or Today to focus on one series."
             ),
-            ft.Divider(),
-            ft.Text("PULSE", weight=ft.FontWeight.BOLD, color="#FF3158"),
-            ft.Text("The task was completed on that day."),
-            ft.Text("CURRENT", weight=ft.FontWeight.BOLD, color="#FF3158"),
-            ft.Text(
-                "The number of pulses in the currently living run. "
-                "One REST day does not end the run; two consecutive missed "
-                "days cause FLATLINE and reset CURRENT to 0."
+        },
+        {
+            "title": "STATUS SYSTEM",
+            "icon": ft.Icons.MONITOR_HEART_OUTLINED,
+            "color": "#FF3158",
+            "keywords": "pulse alive rest flatline revive free day status color red orange gray green",
+            "body": (
+                "PULSE — You completed the habit on a required day.\n\n"
+                "ALIVE — The current chain is still living. Red represents an alive chain.\n\n"
+                "REST — You missed one required day. The chain remains alive, but another "
+                "consecutive missed required day will cause a Flatline.\n\n"
+                "FLATLINE — Two or more consecutive required days were missed. Current "
+                "returns to 0.\n\n"
+                "REVIVE — The first Pulse recorded after a Flatline. The signal becomes "
+                "green on that day and a new living run begins.\n\n"
+                "FREE DAY — No completion is expected. It does not count as a Rest and "
+                "does not damage or extend the chain."
             ),
-            ft.Text("LONGEST", weight=ft.FontWeight.BOLD, color="#FFC857"),
-            ft.Text("The highest number of pulses achieved in one living run."),
-            ft.Text("TOTAL", weight=ft.FontWeight.BOLD, color="#56C8FF"),
-            ft.Text("Every pulse ever recorded for the selected series."),
-            ft.Text("REST", weight=ft.FontWeight.BOLD, color="#F5A623"),
-            ft.Text("One fully missed day. The series is still alive."),
-            ft.Text("FLATLINE", weight=ft.FontWeight.BOLD, color="#8D95A5"),
-            ft.Text("Two or more consecutive fully missed days."),
-            ft.Text("REVIVE", weight=ft.FontWeight.BOLD, color="#35D07F"),
-            ft.Text("The first new pulse after a FLATLINE."),
-            ft.Divider(),
-            ft.Text("SCREENS", size=18, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "Dashboard: view every series and record today's work quickly.\n"
-                "Today: focus on one selected series.\n"
-                "History: explore the calendar, EKG and any day's note.\n"
-                "Notes: search, filter, sort and edit the complete journal."
+        },
+        {
+            "title": "CURRENT, LONGEST & TOTAL",
+            "icon": ft.Icons.QUERY_STATS,
+            "color": "#FFC857",
+            "keywords": "current longest total statistics counter streak run",
+            "body": (
+                "CURRENT — The number of completed required days in the living run. One "
+                "Rest does not immediately end it; a Flatline resets it to 0.\n\n"
+                "LONGEST — The highest Current value this series has ever reached.\n\n"
+                "TOTAL — Every Pulse ever recorded for the series, including Pulses from "
+                "older runs. Rest and Free days do not increase these values."
             ),
-            ft.Text("SERIES MANAGEMENT", size=18, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "Use + NEW SERIES to start another task. The menu beside it "
-                "renames or permanently deletes the selected series. Changing "
-                "the selector updates Today, History and Notes together."
+        },
+        {
+            "title": "THE FIVE MAIN SCREENS",
+            "icon": ft.Icons.VIEW_QUILT_OUTLINED,
+            "color": "#B58CFF",
+            "keywords": "dashboard today history notes collection screens pages",
+            "body": (
+                "DASHBOARD — See all active series, their status and today's remaining "
+                "work. You can record Pulses without opening each series.\n\n"
+                "TODAY — Focus on one series: status, statistics, today's note, the last "
+                "14 days and an active trophy target.\n\n"
+                "HISTORY — Browse the full calendar. Select a date to inspect its status "
+                "and note. A trophy icon and yellow border identify a target date.\n\n"
+                "NOTES — Search, filter, sort and edit the journal of the selected series.\n\n"
+                "COLLECTION — View earned trophies on shelves. Each trophy keeps its own "
+                "series, dates, Pulse count, Rest count and frame."
             ),
-            ft.Text("HISTORY & NOTES", size=18, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "Calendar pulse peaks mark completed days; flat lines mark days "
-                "without a pulse. Select a day to view or edit its note. In "
-                "Notes, use Show, Status, Order and Search to control the journal."
+        },
+        {
+            "title": "PLANS & SPECIFIC DATES",
+            "icon": ft.Icons.CALENDAR_MONTH_OUTLINED,
+            "color": "#56C8FF",
+            "keywords": "schedule plan weekday required free exception specific date change past",
+            "body": (
+                "A weekly plan decides which weekdays require the habit. A new plan starts "
+                "on the date you choose and never rewrites earlier history.\n\n"
+                "Specific dates override the weekly plan. Mark a date as Required when the "
+                "habit should be expected, or Free when no action should be required. You "
+                "can prepare both kinds in the same calendar and save them together.\n\n"
+                "Past plans and specific-date changes stay locked so your historical "
+                "statistics remain trustworthy."
             ),
-            ft.Text("SHARING & ARCHIVE", size=18, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "Archiving hides a series and automatically creates a portable "
-                ".pulse.json file. In Settings, export all data, open the export "
-                "folder, or import a file received from another device. Imported "
-                "series never overwrite an existing series with the same name."
+        },
+        {
+            "title": "TROPHY TARGETS",
+            "icon": ft.Icons.EMOJI_EVENTS_OUTLINED,
+            "color": "#FFC857",
+            "keywords": "trophy target reward gold silver bronze frame rest collection share",
+            "body": (
+                "Choose a future target date and a trophy. The required dates are frozen "
+                "when the target begins, so later plan changes cannot make the target "
+                "easier or harder.\n\n"
+                "A Flatline before completion fails the target. If the chain reaches the "
+                "target alive, the trophy is earned.\n\n"
+                "0 Rest = Gold frame\n1 Rest = Silver frame\n2 Rest = Bronze frame\n"
+                "3 or more Rest days = Frameless\n\n"
+                "Earned trophies enter Collection permanently and can be exported as a "
+                "shareable image card. Only one trophy target can be active per series."
             ),
-            ft.Divider(),
-            ft.Text("IMPORTANT", size=18, weight=ft.FontWeight.BOLD),
-            ft.Text(
-                "Adding a note to a REST or FLATLINE day does not create a "
-                "pulse or change statistics. Future dates and dates before a "
-                "series began cannot be edited. A pulse can be recorded only "
-                "once per series per day."
+        },
+        {
+            "title": "NOTES & HISTORY",
+            "icon": ft.Icons.NOTE_ALT_OUTLINED,
+            "color": "#35D07F",
+            "keywords": "note journal history edit past search filter calendar",
+            "body": (
+                "Notes are independent from Pulse records. Writing on a Rest, Flatline or "
+                "Free day does not create a Pulse or change statistics.\n\n"
+                "Use History for a calendar view and Notes for a searchable journal. Past "
+                "notes can be edited, but future dates and dates before the series began "
+                "cannot be used as history."
             ),
-        ],
-        width=520,
-        height=560,
-        scroll=ft.ScrollMode.AUTO,
-        spacing=8,
-    )
+        },
+        {
+            "title": "DATA, ARCHIVE & TRANSFER",
+            "icon": ft.Icons.INVENTORY_2_OUTLINED,
+            "color": "#A9B0BF",
+            "keywords": "data export import backup archive restore json share device settings",
+            "body": (
+                "Archiving hides a series from daily screens without deleting it and "
+                "automatically creates a portable backup.\n\n"
+                "Settings can export one series or all series to a .pulse.json file. An "
+                "import adds the transferred series without overwriting existing series "
+                "with the same name. Pulses, notes, plans, specific dates and trophy data "
+                "are included. Keep exported files somewhere safe."
+            ),
+        },
+        {
+            "title": "FREQUENT QUESTIONS",
+            "icon": ft.Icons.HELP_CENTER_OUTLINED,
+            "color": "#FF7A45",
+            "keywords": "faq question undo delete plan target note free missed record once",
+            "body": (
+                "What happens if I miss one required day?\nIt becomes a Rest, but the chain "
+                "is still alive.\n\n"
+                "Does a Free day break my chain?\nNo. It is skipped completely.\n\n"
+                "Can I record more than one Pulse in a day?\nNo. Each series accepts one "
+                "Pulse per date.\n\n"
+                "Can I undo today's Pulse?\nYes. Use Undo Pulse on Today or Dashboard. You "
+                "can choose whether to keep the note.\n\n"
+                "Does changing my weekly plan alter old dates?\nNo. The new plan begins on "
+                "its selected start date.\n\n"
+                "Does changing the plan alter an active trophy?\nNo. Its required dates "
+                "were frozen when the target started.\n\n"
+                "Does deleting a series remove its data?\nYes. Use Archive when you may "
+                "want the series later; permanent deletion cannot be undone."
+            ),
+        },
+    ]
 
-    help_dialog = ft.AlertDialog(
-        modal=True,
-        title=ft.Text("How The Pulse works"),
-        content=help_content,
-        actions=[
-            ft.Button(content="Close", on_click=lambda e: page.pop_dialog()),
-        ],
+    help_search = ft.TextField(
+        label="Search help topics",
+        hint_text="Try: Flatline, trophy, Free day, export...",
+        prefix_icon=ft.Icons.SEARCH,
+        width=560,
     )
+    help_topics_list = ft.Column(spacing=10)
+    help_result_summary = ft.Text(size=11, color="#8D95A5")
+
+    def build_help_topics(e=None):
+        query = (help_search.value or "").strip().lower()
+        matches = []
+        for topic in help_topics:
+            searchable = " ".join(
+                [topic["title"], topic["keywords"], topic["body"]]
+            ).lower()
+            if query and query not in searchable:
+                continue
+            matches.append(topic)
+        help_topics_list.controls = [
+            ft.Container(
+                content=ft.ExpansionTile(
+                    title=ft.Row(
+                        controls=[
+                            ft.Icon(topic["icon"], color=topic["color"], size=22),
+                            ft.Text(topic["title"], weight=ft.FontWeight.BOLD),
+                        ],
+                        spacing=10,
+                    ),
+                    controls=[
+                        ft.Container(
+                            content=ft.Text(
+                                topic["body"], size=13, color="#D7DBE5", selectable=True
+                            ),
+                            padding=ft.Padding.only(left=16, right=16, bottom=16),
+                        )
+                    ],
+                    expanded=bool(query),
+                ),
+                bgcolor="#151923",
+                border=ft.Border.all(1, "#252B38"),
+                border_radius=12,
+            )
+            for topic in matches
+        ] or [
+            ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Icon(ft.Icons.SEARCH_OFF, size=34, color="#72798A"),
+                        ft.Text("No help topic matches your search.", color="#A9B0BF"),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                padding=24,
+            )
+        ]
+        help_result_summary.value = (
+            f"{len(matches)} topic(s) found" if query else
+            "Choose a topic below or search for a feature."
+        )
+        if e is not None:
+            page.update()
+
+    help_search.on_change = build_help_topics
+    help_view = ft.Column(
+        controls=[
+            ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.HELP_OUTLINE, size=30, color="#FF3158"),
+                    ft.Column(
+                        controls=[
+                            ft.Text("HELP & GUIDE", size=24, weight=ft.FontWeight.BOLD),
+                            ft.Text(
+                                "Understand the rules and find answers quickly.",
+                                size=12,
+                                color="#A9B0BF",
+                            ),
+                        ],
+                        spacing=1,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+            ),
+            help_search,
+            help_result_summary,
+            help_topics_list,
+        ],
+        visible=False,
+        width=674,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=12,
+    )
+    build_help_topics()
 
     def open_help(e):
-        page.show_dialog(help_dialog)
+        help_search.value = ""
+        build_help_topics()
+        show_section("help")
 
     onboarding_dialog = ft.AlertDialog(
         modal=True,
@@ -5723,14 +5966,20 @@ def main(page: ft.Page):
             page.update()
 
     def show_onboarding_again(e):
-        page.pop_dialog()
         page.show_dialog(onboarding_dialog)
 
-    settings_dialog = ft.AlertDialog(
-        modal=True,
-        title=ft.Text("Settings"),
-        content=ft.Column(
-            controls=[
+    settings_view = ft.Column(
+        controls=[
+            ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.SETTINGS_OUTLINED, size=30, color="#FF3158"),
+                    ft.Text("SETTINGS", size=24, weight=ft.FontWeight.BOLD),
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+            ),
+            ft.Container(
+                content=ft.Column(
+                    controls=[
                 default_screen_setting,
                 week_start_setting,
                 compact_dashboard_setting,
@@ -5778,23 +6027,199 @@ def main(page: ft.Page):
                 archived_series_list,
                 ft.Button(content="SHOW INTRODUCTION", on_click=show_onboarding_again),
                 settings_message,
-            ],
-            width=520,
-            height=570,
-            scroll=ft.ScrollMode.AUTO,
-            spacing=10,
-        ),
-        actions=[
-            ft.TextButton(content="Close", on_click=lambda e: page.pop_dialog()),
-            ft.Button(content="Save", on_click=save_settings),
+                ft.Button(content="SAVE SETTINGS", on_click=save_settings),
+                    ],
+                    spacing=10,
+                ),
+                width=674,
+                padding=18,
+                bgcolor="#151923",
+                border=ft.Border.all(1, "#252B38"),
+                border_radius=16,
+            ),
         ],
+        visible=False,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=14,
     )
 
     def open_settings(e):
         settings_message.value = ""
         refresh_export_options()
         refresh_archived_series()
-        page.show_dialog(settings_dialog)
+        show_section("settings")
+
+    profile_name_field = ft.TextField(
+        label="Display name",
+        value=get_setting("profile_name") or "Yaren",
+        max_length=50,
+    )
+    profile_email_field = ft.TextField(
+        label="E-mail (optional)",
+        value=get_setting("profile_email") or "",
+        hint_text="Account connection will be added later",
+    )
+    profile_message = ft.Text(size=12, color="#56C8FF")
+    profile_large_avatar = ft.Container(
+        width=128,
+        height=128,
+        alignment=ft.Alignment.CENTER,
+        bgcolor="#202633",
+        border=ft.Border.all(3, "#343A48"),
+        border_radius=64,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+    )
+    profile_header_avatar = ft.Container(
+        width=38,
+        height=38,
+        alignment=ft.Alignment.CENTER,
+        bgcolor="#202633",
+        border=ft.Border.all(2, "#343A48"),
+        border_radius=19,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        ink=True,
+    )
+
+    def profile_initial():
+        name = (profile_name_field.value or "User").strip()
+        return (name[:1] or "U").upper()
+
+    def refresh_profile_avatars():
+        image_path = get_setting("profile_image_path") or ""
+        if image_path and Path(image_path).is_file():
+            import base64
+            encoded_image = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+            profile_large_avatar.content = ft.Image(
+                src_base64=encoded_image,
+                width=128, height=128, fit=ft.BoxFit.COVER,
+            )
+            profile_header_avatar.content = ft.Image(
+                src_base64=encoded_image,
+                width=38, height=38, fit=ft.BoxFit.COVER,
+            )
+        else:
+            initial = profile_initial()
+            profile_large_avatar.content = ft.Text(
+                initial, size=48, weight=ft.FontWeight.BOLD, color="#F4F6FA"
+            )
+            profile_header_avatar.content = ft.Text(
+                initial, size=16, weight=ft.FontWeight.BOLD, color="#F4F6FA"
+            )
+
+    def choose_profile_image(e):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            selected_path = filedialog.askopenfilename(
+                title="Choose profile image",
+                filetypes=[
+                    ("Image files", "*.png *.jpg *.jpeg *.webp"),
+                    ("All files", "*.*"),
+                ],
+            )
+            root.destroy()
+            if selected_path:
+                save_setting("profile_image_path", selected_path)
+                profile_message.value = "Profile image selected."
+                profile_message.color = "#35D07F"
+                refresh_profile_avatars()
+        except (ImportError, OSError, RuntimeError):
+            profile_message.value = "The image picker could not open on this device."
+            profile_message.color = "#FF5D73"
+        page.update()
+
+    def remove_profile_image(e):
+        save_setting("profile_image_path", "")
+        profile_message.value = "Profile image removed. Your initial is shown again."
+        profile_message.color = "#A9B0BF"
+        refresh_profile_avatars()
+        page.update()
+
+    def save_user_profile(e):
+        display_name = (profile_name_field.value or "").strip()
+        if not display_name:
+            profile_message.value = "Enter a display name."
+            profile_message.color = "#FF5D73"
+            page.update()
+            return
+        save_setting("profile_name", display_name)
+        save_setting("profile_email", (profile_email_field.value or "").strip())
+        profile_message.value = "Profile saved."
+        profile_message.color = "#35D07F"
+        refresh_profile_avatars()
+        page.update()
+
+    profile_view = ft.Column(
+        controls=[
+            ft.Text("PROFILE", size=24, weight=ft.FontWeight.BOLD),
+            ft.Container(
+                content=ft.Column(
+                    controls=[
+                        profile_large_avatar,
+                        ft.Row(
+                            controls=[
+                                ft.Button(
+                                    content="CHOOSE IMAGE",
+                                    icon=ft.Icons.ADD_A_PHOTO_OUTLINED,
+                                    on_click=choose_profile_image,
+                                ),
+                                ft.TextButton(
+                                    content="REMOVE IMAGE",
+                                    on_click=remove_profile_image,
+                                ),
+                            ],
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            wrap=True,
+                        ),
+                        ft.Text(
+                            "Built-in profile images will be available here later. "
+                            "Until then, use your initial or choose an image.",
+                            size=12,
+                            color="#A9B0BF",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        profile_name_field,
+                        profile_email_field,
+                        ft.Button(content="SAVE PROFILE", on_click=save_user_profile),
+                        profile_message,
+                    ],
+                    spacing=14,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                width=520,
+                padding=24,
+                bgcolor="#151923",
+                border=ft.Border.all(1, "#252B38"),
+                border_radius=16,
+            ),
+        ],
+        visible=False,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=14,
+    )
+
+    def open_user_profile(e):
+        profile_name_field.value = get_setting("profile_name") or "Yaren"
+        profile_email_field.value = get_setting("profile_email") or ""
+        profile_message.value = ""
+        refresh_profile_avatars()
+        show_section("profile")
+
+    settings_icon_button = ft.IconButton(
+        icon=ft.Icons.SETTINGS_OUTLINED,
+        tooltip="Settings",
+        on_click=open_settings,
+    )
+    help_icon_button = ft.IconButton(
+        icon=ft.Icons.HELP_OUTLINE,
+        tooltip="Help & guide",
+        on_click=open_help,
+    )
+    profile_header_avatar.on_click = open_user_profile
+    refresh_profile_avatars()
 
     dashboard_tab = ft.Button(content="DASHBOARD")
     today_tab = ft.Button(content="TODAY")
@@ -5817,12 +6242,25 @@ def main(page: ft.Page):
     )
 
     def show_section(section_name):
-        series_management_row.visible = section_name not in {"dashboard", "collection"}
+        series_management_row.visible = section_name in {"today", "history", "notes"}
         dashboard_view.visible = section_name == "dashboard"
         today_view.visible = section_name == "today"
         history_view.visible = section_name == "history"
         notes_view.visible = section_name == "notes"
         collection_view.visible = section_name == "collection"
+        settings_view.visible = section_name == "settings"
+        profile_view.visible = section_name == "profile"
+        help_view.visible = section_name == "help"
+        help_icon_button.icon_color = (
+            "#FF3158" if section_name == "help" else "#A9B0BF"
+        )
+        settings_icon_button.icon_color = (
+            "#FF3158" if section_name == "settings" else "#A9B0BF"
+        )
+        profile_header_avatar.border = ft.Border.all(
+            3 if section_name == "profile" else 2,
+            "#FF3158" if section_name == "profile" else "#343A48",
+        )
         for button, name in [
             (dashboard_tab, "dashboard"),
             (today_tab, "today"),
@@ -5882,16 +6320,9 @@ def main(page: ft.Page):
                             ft.Container(
                                 content=ft.Row(
                                     controls=[
-                                        ft.IconButton(
-                                            icon=ft.Icons.HELP_OUTLINE,
-                                            tooltip="Help",
-                                            on_click=open_help,
-                                        ),
-                                        ft.IconButton(
-                                            icon=ft.Icons.SETTINGS_OUTLINED,
-                                            tooltip="Settings",
-                                            on_click=open_settings,
-                                        ),
+                                        help_icon_button,
+                                        settings_icon_button,
+                                        profile_header_avatar,
                                     ],
                                     spacing=6,
                                     tight=True,
@@ -5922,6 +6353,9 @@ def main(page: ft.Page):
                     history_view,
                     notes_view,
                     collection_view,
+                    settings_view,
+                    profile_view,
+                    help_view,
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=18,
